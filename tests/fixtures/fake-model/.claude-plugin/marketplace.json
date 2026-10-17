@@ -1,0 +1,1 @@
+{"name":"slot-test-source","metadata":{"description":"Local fixed-response fixture for tests only"},"owner":{"name":"Test"},"plugins":[{"name":"slot-test-model","source":"./"}]}

@@ -10,7 +10,7 @@
 
 The primary listing is this GitHub repository and its bundled Claude marketplace. Use the `claude-code`, `claude-code-plugin`, `concurrency`, and `fifo` topics. A suitable announcement:
 
-> Slot Guard is an AGPL-3.0 Claude Code mod that coordinates FIFO concurrency limits across local terminals and subagents. No daemon, no tokens spent waiting, and optional slot bars in your existing statusline. First public beta supports native Claude on macOS. Install: `claude plugin install slot-guard --marketplace JCKodel/slot-guard`.
+> Slot Guard is an AGPL-3.0 Claude Code mod that limits working agents across local terminals and subagents, including foreground tool execution. No daemon, no tokens spent waiting, and optional slot bars in your existing statusline. First public beta supports native Claude on macOS. Install: `claude plugin install slot-guard --marketplace JCKodel/slot-guard`.
 
 Additional distribution can include community plugin directories and a Show HN or community discussion after beta feedback. For Anthropic's directory, submit via https://claude.ai/directory/manage using a paid Claude account. This requires a separate portal submission and review; a GitHub release does not submit it automatically. The mod is Claude Code-specific; do not advertise Cowork or claude.ai compatibility.
 

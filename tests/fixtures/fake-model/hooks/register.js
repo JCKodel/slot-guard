@@ -5,7 +5,22 @@ export function register(on) {
     const home = await $.env.get('CLAUDE_SLOT_HOME');
     const delay = await $.env.get('SLOT_TEST_DELAY');
     const children = await $.env.get('SLOT_TEST_CHILDREN');
+    const mode = await $.env.get('SLOT_TEST_MODE');
     const name = session + (e.agentId ? '-' + e.agentId : '');
+    if (mode === 'tools' && e.index === 0) {
+      const quote = s => "'" + s.replaceAll("'", "'\\''") + "'";
+      const command = ['python3', $.plugin.root + '/worker.py', home, name, delay || '1'].map(quote).join(' ');
+      const input = {command, description:'Local slot test tool', timeout:30000};
+      yield {kind:'tool',index:0,id:'local-tool',name:'Bash'};
+      yield {kind:'input',index:0,json:JSON.stringify(input)};
+      yield {kind:'stop',stopReason:'tool_use',usage:null};
+      return {turnId:e.turnId,index:e.index,answer:'',toolUses:[{name:'Bash',input}],stopReason:'tool_use',usage:null};
+    }
+    if (mode === 'barrier' && !e.agentId && !spawned) {
+      await $.fs.write(home + '/' + name + '.parent-ready', 'ready');
+      await $.process.run(['python3','-c',
+        'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); end=time.monotonic()+20\nwhile not p.exists() and time.monotonic()<end: time.sleep(.05)\nassert p.exists()', home+'/parents-go']);
+    }
     if (children === '1' && !e.agentId && !spawned) {
       spawned = true;
       const input = {description:'Local slot test',prompt:'Reply OK.',subagent_type:'general-purpose'};

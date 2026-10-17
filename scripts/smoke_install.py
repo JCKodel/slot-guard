@@ -17,8 +17,10 @@ with tempfile.TemporaryDirectory(prefix='slot-install-') as tmp:
            'SLOT_TEST_DELAY':'0', 'SLOT_TEST_CHILDREN':'0'}
     subprocess.run(['claude','plugin','install','slot-guard','--marketplace',source],
                    env=env, check=True, timeout=120)
+    subprocess.run(['claude','plugin','install','slot-test-model','--marketplace',str(root/'tests/fixtures/fake-model')],
+                   env=env, check=True, timeout=30)
     result = subprocess.run(['claude','-p','Local smoke test.',
-        '--plugin-dir',str(root/'tests/fixtures/fake-model'), '--setting-sources','user',
+        '--setting-sources','user',
         '--strict-mcp-config','--tools','','--disable-slash-commands','--no-session-persistence',
         '--prompt-suggestions','false','--system-prompt','Test.','--model','haiku',
         '--effort','low','--output-format','json'], cwd=tmp, env=env, capture_output=True,text=True,timeout=30)
@@ -29,4 +31,8 @@ with tempfile.TemporaryDirectory(prefix='slot-install-') as tmp:
     assert response['total_cost_usd']==0, response
     assert response['duration_api_ms']==0, response
     assert (Path(tmp)/'state/queue.sqlite3').exists(), 'Guard was not invoked'
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(Path(tmp)/'state/queue.sqlite3')) as db:
+        assert db.execute("SELECT count(*) FROM tickets WHERE pool='agent'").fetchone()[0] > 0
     print('Marketplace install and isolated startup passed; API cost $0.')

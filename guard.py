@@ -108,11 +108,11 @@ def claude_owner():
 
 
 class Queue:
-    def __init__(self, db, jobs=4, requests=4, identity=process_identity):
-        if any(type(n) is not int or n < 1 for n in (jobs, requests)):
+    def __init__(self, db, agents=4, identity=process_identity):
+        if any(type(n) is not int or n < 1 for n in (agents,)):
             raise ValueError('Limits must be positive integers')
         self.identity = identity
-        self.limits = {'job': jobs, 'request': requests}
+        self.limits = {'agent': agents}
         self.condition = threading.Condition(threading.RLock())
         self.db = sqlite3.connect(db, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -147,7 +147,7 @@ class Queue:
 
     @staticmethod
     def validate(data):
-        if data.get('pool') not in ('job', 'request'):
+        if data.get('pool') != 'agent':
             raise ValueError('Invalid pool')
         for key in ('key', 'session', 'turn', 'birth'):
             if not isinstance(data.get(key), str) or not 0 < len(data[key]) <= 512:
@@ -161,7 +161,7 @@ class Queue:
             with self.condition:
                 return {'limits': self.limits, 'tickets': [dict(r) for r in self.db.execute(
                     "SELECT seq,pool,session,turn,pid,state FROM tickets WHERE state!='released' ORDER BY seq")]}
-        if op not in ('acquire', 'release', 'finish'):
+        if op not in ('acquire', 'release'):
             raise ValueError('Unknown operation')
         self.validate(data)
         values = tuple(data[k] for k in ('key', 'pool', 'session', 'turn', 'pid', 'birth'))
@@ -180,10 +180,6 @@ class Queue:
                     self.db.execute('INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES(?,?,?,?,?,?,?,?)',
                                     (*values, 'released', time.time()))
                     self.db.execute("UPDATE tickets SET state='released' WHERE key=?", (data['key'],))
-                elif op == 'finish':
-                    # Only the main job. Do not free outstanding inference slots here.
-                    self.db.execute("UPDATE tickets SET state='released' WHERE pool='job' AND session=? AND turn=? AND pid=? AND birth=?",
-                                    (data['session'], data['turn'], data['pid'], data['birth']))
                 self._promote()
             self.condition.notify_all()
             if op != 'acquire':
@@ -214,7 +210,7 @@ def local_call(home, data):
                         raise RuntimeError('Coordinator lock timeout; admission refused')
                     time.sleep(0.025)
             config = json.loads((home/'config.json').read_text())
-            q = Queue(home/'queue.sqlite3', config['jobs'], config['requests'])
+            q = Queue(home/'queue.sqlite3', config['agents'])
             try:
                 q.reap()
                 result = q.operate({**data, 'wait': 0})
@@ -225,20 +221,39 @@ def local_call(home, data):
         time.sleep(min(0.25, max(0, deadline-time.monotonic())))
 
 
-def initialize(home, jobs, requests, replace=False):
-    if any(type(n) is not int or n < 1 for n in (jobs, requests)):
-        raise ValueError('Limits must be positive integers')
+def initialize(home, agents=4, replace=False):
+    if type(agents) is not int or agents < 1:
+        raise ValueError('Agent limit must be a positive integer')
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(home, 0o700)
     with (home/'initialize.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         config = home/'config.json'
-        if replace or not config.exists():
-            if not replace and (home/'queue.sqlite3').exists():
-                raise RuntimeError('Missing configuration for existing queue; admission refused')
+        old = json.loads(config.read_text()) if config.exists() else None
+        database = home/'queue.sqlite3'
+        if old is None and database.exists():
+            raise RuntimeError('Missing configuration for existing queue; admission refused')
+        migrating = old is not None and 'agents' not in old
+        if migrating:
+            # Older processes use the old admission protocol. Never mix both pools.
+            with (home/'coordinator.lock').open('a') as coordinator:
+                fcntl.flock(coordinator, fcntl.LOCK_EX)
+                if database.exists():
+                    db = sqlite3.connect(database)
+                    try:
+                        for pid, birth in db.execute('SELECT DISTINCT pid,birth FROM tickets'):
+                            if process_identity(pid) == birth:
+                                raise RuntimeError('Close all legacy Claude sessions before migrating Slot Guard')
+                        db.execute('DELETE FROM tickets')
+                        db.commit()
+                    finally:
+                        db.close()
+            if not replace:
+                agents = min(old['jobs'], old['requests'])
+        if replace or old is None or migrating:
             temporary = home/'config.json.tmp'
             with temporary.open('w') as f:
-                json.dump({'jobs': jobs, 'requests': requests}, f)
+                json.dump({'agents': agents, 'schema': 2}, f)
                 f.flush()
                 os.fsync(f.fileno())
             temporary.replace(config)
@@ -250,23 +265,21 @@ def main():
     p.add_argument('--home', type=Path, default=Path(os.environ.get('CLAUDE_SLOT_HOME', DEFAULT_HOME)))
     sub = p.add_subparsers(dest='command', required=True)
     s = sub.add_parser('init')
-    s.add_argument('--jobs', type=int, default=4)
-    s.add_argument('--requests', type=int, default=4)
+    s.add_argument('--agents', type=int, default=4)
     c = sub.add_parser('configure')
-    c.add_argument('--jobs', type=int, required=True)
-    c.add_argument('--requests', type=int, required=True)
+    c.add_argument('--agents', type=int, required=True)
     sub.add_parser('status')
     sub.add_parser('client')
     args = p.parse_args()
     os.umask(0o077)
     if args.command == 'init':
-        print(json.dumps(initialize(args.home, args.jobs, args.requests), indent=2))
+        print(json.dumps(initialize(args.home, args.agents), indent=2))
     elif args.command == 'configure':
-        print(json.dumps(initialize(args.home, args.jobs, args.requests, replace=True), indent=2))
+        print(json.dumps(initialize(args.home, args.agents, replace=True), indent=2))
     elif args.command == 'status':
         print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
     else:
-        initialize(args.home, 4, 4)
+        initialize(args.home)
         data = json.loads(sys.stdin.read(MAX_MESSAGE))
         if data.get('op') != 'status':
             data.update(claude_owner())

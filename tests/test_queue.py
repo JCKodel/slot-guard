@@ -15,13 +15,13 @@ class QueueTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name)/'queue.db'
         self.live = {10:'birth'}
-        self.q = Queue(self.path, 4, 4, self.live.get)
+        self.q = Queue(self.path, 4, self.live.get)
 
     def tearDown(self):
         self.q.db.close()
         self.temp.cleanup()
 
-    def data(self, key, pool='job', **overrides):
+    def data(self, key, pool='agent', **overrides):
         return {'op':'acquire','key':key,'pool':pool,'session':'s','turn':key,
                 'pid':10,'birth':'birth', **overrides}
 
@@ -58,7 +58,7 @@ class QueueTests(unittest.TestCase):
         for i in range(6):
             self.q.operate(self.data(str(i)))
         self.q.db.close()
-        self.q = Queue(self.path, 4, 4, self.live.get)
+        self.q = Queue(self.path, 4, self.live.get)
         self.q.reap()
         self.assertEqual(self.q.operate(self.data('4'))['position'], 1)
         self.q.operate(self.data('0',op='release'))
@@ -78,9 +78,9 @@ class QueueTests(unittest.TestCase):
         self.q.reap()
         self.assertEqual(self.q.operate({'op':'status'})['tickets'][0]['state'],'granted')
 
-    def test_child_inference_not_blocked_by_full_job_pool(self):
+    def test_main_and_children_share_one_pool(self):
         for i in range(4): self.q.operate(self.data(str(i)))
-        self.assertEqual(self.q.operate(self.data('child','request'))['state'],'granted')
+        self.assertEqual(self.q.operate(self.data('child'))['state'],'queued')
 
     def test_wrong_owner_cannot_release_ticket(self):
         self.q.operate(self.data('a'))

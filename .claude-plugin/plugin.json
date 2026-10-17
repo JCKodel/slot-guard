@@ -1,7 +1,7 @@
 {
   "name": "slot-guard",
-  "version": "0.2.0-beta.2",
-  "description": "Machine-wide FIFO concurrency slots for Claude Code turns and inference. Local coordination, no daemon.",
+  "version": "0.3.0-beta.1",
+  "description": "One machine-wide FIFO limit for working Claude Code agents, including subagents and tool execution.",
   "author": {
     "name": "J.C.K\u00f6del",
     "url": "https://github.com/JCKodel"

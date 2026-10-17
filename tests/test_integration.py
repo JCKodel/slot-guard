@@ -23,7 +23,7 @@ class IntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='slot-test-')
         self.home = Path(self.temp.name)
-        initialize(self.home, 4, 4)
+        initialize(self.home, 4)
         self.children = []
         self.owner = {'pid':os.getpid(),'birth':process_identity(os.getpid())}
 
@@ -34,7 +34,7 @@ class IntegrationTests(unittest.TestCase):
             p.communicate(timeout=10)
         self.temp.cleanup()
 
-    def ticket(self, key, pool='job', **extra):
+    def ticket(self, key, pool='agent', **extra):
         return {'op':'acquire','key':key,'pool':pool,'session':'holder','turn':key,
                 **self.owner, **extra}
 
@@ -49,21 +49,21 @@ class IntegrationTests(unittest.TestCase):
             time.sleep(.05)
         self.fail('Timed out waiting for condition')
 
-    def claude(self, delay=.1, home=None, children=False, stream=False):
+    def claude(self, delay=.1, home=None, children=False, stream=False, mode=""):
         sid=str(uuid.uuid4())
         home=home or self.home
         env={**test_environment(),'CLAUDE_SLOT_HOME':str(home),'SLOT_TEST_DELAY':str(delay),
-             'SLOT_TEST_CHILDREN':'1' if children else '0',
+             'SLOT_TEST_CHILDREN':'1' if children else '0', 'SLOT_TEST_MODE':mode,
              'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1',
              'ANTHROPIC_API_KEY':'local-test-not-a-key', 'ANTHROPIC_BASE_URL':'http://127.0.0.1:1'}
         command=[shutil.which('claude'),'-p','Local test, no inference.',
             '--plugin-dir',str(ROOT),'--plugin-dir',str(ROOT/'tests/fixtures/fake-model'),
-            '--setting-sources','','--strict-mcp-config','--tools','Agent' if children else '',
+            '--setting-sources','','--strict-mcp-config','--tools','Agent,Bash' if children or mode=='tools' else '',
             '--disable-slash-commands','--no-session-persistence','--prompt-suggestions','false',
             '--system-prompt','Test.','--model','haiku','--effort','low',
             '--session-id',sid,'--max-budget-usd','0.01','--output-format','json',
             '--debug-file',str(self.home/(sid+'.debug.log'))]
-        if children: command += ['--allowedTools','Agent','--permission-mode','dontAsk']
+        if children or mode=='tools': command += ['--allowedTools','Agent','Bash','--permission-mode','dontAsk']
         if stream:
             command.remove('Local test, no inference.')
             command[command.index('--output-format')+1]='stream-json'
@@ -108,7 +108,7 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
         self.wait_for(lambda:any(t['session']==sixth and t['state']=='queued' for t in self.status()))
         self.assertFalse((self.home/(fifth+'.started')).exists())
         self.assertFalse((self.home/(sixth+'.started')).exists())
-        peak={'job':0,'request':0}
+        peak={'agent':0}
         deadline = time.monotonic() + 60
         while any(p.poll() is None for p in self.children):
             self.assertLess(time.monotonic(), deadline, 'Claude processes did not finish')
@@ -144,7 +144,7 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
     def test_kill_holder_recovers_capacity(self):
         sid,p=self.claude(delay=30)
         self.wait_for(lambda:(self.home/(sid+'.started')).exists())
-        self.assertEqual(len([t for t in self.status() if t['session']==sid]),2)
+        self.assertEqual(len([t for t in self.status() if t['session']==sid]),1)
         p.kill();p.communicate(timeout=10)
         self.assertFalse(any(t['session']==sid for t in self.status()))
 
@@ -168,15 +168,47 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
                 local_call(self.home,self.ticket('blocked'))
         self.assertEqual(self.status(),[])
 
-    def test_actual_subagents_run_with_full_parent_pool(self):
-        (self.home/'config.json').write_text(json.dumps({'jobs':4,'requests':1}))
+    def test_actual_subagents_share_one_free_slot_with_three_existing_agents(self):
+        (self.home/'config.json').write_text(json.dumps({'agents':4,'schema':2}))
         for i in range(3): local_call(self.home,self.ticket(str(i)))
         sid,p=self.claude(delay=.2,children=True)
         result=self.result(p)
         self.assertEqual(result['subagent_stats']['spawned'],3)
         self.assertEqual(result['subagent_stats']['completed'],3)
         self.assertEqual(len(list(self.home.glob(sid+'-*.finished'))),3)
-        self.assertEqual(len(self.status()),3)  # Only synthetic holder jobs remain.
+        self.assertEqual(len(self.status()),3)  # Only the three synthetic agent holders remain.
+
+    def test_tools_keep_agent_slots_and_fifth_session_waits(self):
+        for _ in range(4):
+            sid,p=self.claude(delay=5,mode='tools')
+            self.wait_for(lambda:(self.home/(sid+'.tool-started')).exists())
+        fifth,p5=self.claude(delay=.1,mode='tools')
+        self.wait_for(lambda:any(t['session']==fifth and t['state']=='queued' for t in self.status()))
+        self.assertFalse((self.home/(fifth+'.tool-started')).exists())
+        self.assertEqual(sum(t['state']=='granted' for t in self.status()),4)
+        for p in self.children: self.result(p)
+        self.assertEqual(len(list(self.home.glob('*.tool-finished'))),5)
+        self.assertEqual(self.status(),[])
+
+    def test_four_parents_can_delegate_without_deadlock(self):
+        for _ in range(4):
+            sid,p=self.claude(delay=.3,children=True,mode='barrier')
+            self.wait_for(lambda:(self.home/(sid+'.parent-ready')).exists())
+        self.assertEqual(sum(t['state']=='granted' for t in self.status()),4)
+        (self.home/'parents-go').write_text('go')
+        end=time.monotonic()+30
+        peak=0
+        while any(p.poll() is None for p in self.children):
+            self.assertLess(time.monotonic(),end,'Delegating parents deadlocked')
+            used=sum(t['state']=='granted' for t in self.status())
+            peak=max(peak,used)
+            self.assertLessEqual(used,4)
+            time.sleep(.025)
+        for p in self.children:
+            r=self.result(p)
+            self.assertEqual(r['subagent_stats']['completed'],3)
+        self.assertEqual(self.status(),[])
+        print('Four parents / twelve children completed; peak working agents:',peak,flush=True)
 
     def test_interrupt_waiting_turn_keeps_session_usable(self):
         for i in range(4): local_call(self.home,self.ticket(str(i)))

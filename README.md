@@ -1,14 +1,14 @@
 # Slot Guard
 
-Machine-wide FIFO concurrency slots for **Claude Code**. Keep multiple terminals and subagents from starting inference at the same time beyond your configured limit.
+Machine-wide FIFO concurrency slots for **Claude Code**. Limit the total number of working main agents and subagents across terminals, including time spent executing tools.
 
 ```text
-Slots T ■■■■ 4/4 I ■■□□ 2/4 · ⌛ turn #1
+Agents ■■■■ 4/4 · ⌛ #1
 ```
 
 **Beta · macOS · native Claude Code 2.1.302+ · Python 3.10+ · AGPL-3.0-only**
 
-Four terminals can work while a fifth waits locally. Requests from subagents share the inference pool; they do not compete with their parents for turn slots. No queue server, daemon, npm dependencies, telemetry, or model calls to manage the queue.
+Four agents can work while a fifth waits locally. Main agents and subagents share one pool. An agent holds its slot across model steps and ordinary tools, until its turn finishes. A parent waiting only for children yields its slot and reacquires before doing more work. No queue server, daemon, npm dependencies, telemetry, or model calls to manage the queue.
 
 ## Install
 
@@ -18,7 +18,7 @@ Make sure `python3` is on the PATH used by Claude Code. From your terminal:
 claude plugin install slot-guard --marketplace JCKodel/slot-guard
 ```
 
-Restart all Claude Code sessions that should participate. The first use creates private state in `~/.local/state/slot-guard` with **4 turn slots and 4 inference slots**. Run `/slots` in Claude Code to inspect occupancy and the queue. This is a local command, not a prompt sent to a model.
+Restart all Claude Code sessions that should participate. The first use creates private state in `~/.local/state/slot-guard` with **4 working-agent slots**. Run `/slots` in Claude Code to inspect occupancy and the queue. This is a local command, not a prompt sent to a model.
 
 Do not enable two copies of Slot Guard in one session. If you used the earlier private prototype, disable it before enabling this version. The public version intentionally uses a different state directory; the two versions do not coordinate with each other by default.
 
@@ -38,11 +38,17 @@ For configuration and optional statusline installation, keep a checkout:
 ```sh
 git clone https://github.com/JCKodel/slot-guard.git
 cd slot-guard
-python3 guard.py configure --jobs 4 --requests 4
+python3 guard.py configure --agents 4
 python3 guard.py status
 ```
 
-`--jobs` limits active **main turns**, including time spent executing their tools. `--requests` limits concurrent **model steps**, including subagents. A model step holds its slot for the complete response stream. A main turn acquires its turn slot before its inference slot. Subagents acquire only inference slots.
+`--agents` is the single global limit. Four sessions without children, two working parents plus two working children, or one working parent plus three children all use four slots. Idle terminals and parents suspended waiting only for children do not count as working.
+
+A slot spans inference and ordinary tools, not merely an API response. `Agent`/legacy `Task` delegation and blocking `TaskOutput` waits let a parent yield. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
+
+### Upgrading from 0.2.x or the private prototype
+
+Finish work and close **all** participating Claude sessions before updating. Do not mix versions. On first use, configuration migrates to one agent limit using the smaller of the old two limits. Migration refuses to proceed while legacy ticket owners are alive or cannot be inspected. Do not delete the database to bypass this check. Existing terminal sessions must be restarted to load the new hooks. If using the optional copied statusline helpers, remove and reinstall them from the updated checkout.
 
 Lowering a limit does not interrupt existing work; the queue drains to the new limit. For predictable changes, configure while your sessions are idle. Limits must be positive integers. All participating terminals must run as the same OS user and use the same state path on a local filesystem. Set `CLAUDE_SLOT_HOME` to an absolute path in your shell to override that path; export it consistently in every terminal and the statusline environment.
 
@@ -58,10 +64,10 @@ This explicitly updates your Claude `settings.json`, saves the previous statusli
 
 ```text
 [your existing model / project / usage bars]
-Slots T ■■■□ 3/4 I ■■□□ 2/4 · ⌛ inference #2
+Agents ■■■□ 3/4 · ⌛ #2
 ```
 
-`■` is occupied; `□` is available. `T` counts main turns and `I` counts inference. Queue positions are specific to the current session. The display is read-only and refreshes every five seconds. It does not split or reformat your existing bars. Slow existing commands have a three-second timeout.
+`■` is occupied; `□` is available. The single count includes all working main agents and subagents. Queue positions are specific to the current session. The display is read-only and refreshes every five seconds. It does not split or reformat your existing bars. Slow existing commands have a three-second timeout.
 
 Restore the previous statusline:
 
@@ -73,14 +79,14 @@ The remover preserves unrelated settings and refuses to overwrite a statusline y
 
 ## Guarantees and limits
 
-- FIFO ordering applies **within each pool**, according to the order tickets enter the database. OS scheduling may change when admitted work visibly starts.
+- FIFO ordering applies to agent admissions and resumptions, according to the order tickets enter the database. OS scheduling may change when admitted work visibly starts.
 - SQLite transactions plus an OS file lock serialize admission across processes.
 - Reservations do not expire. Explicit release or a confirmed dead owner releases them. PID reuse is checked against process birth identity.
 - If the coordinator fails, the mod aborts the turn without calling the next model handler. Unknown process state retains reservations.
 - Cancellation uses tombstones so a delayed acquire cannot resurrect canceled work. Waiting polls locally and consumes no model tokens.
 - This controls concurrency, **not total tokens, spend, or the Claude usage window**. It does not prevent the same amount of work from eventually consuming the same tokens.
 - Only sessions that load and execute the mod participate. Disabled plugins, other clients, other OS users, and other machines are outside its control. This is not a security boundary or a billing guarantee.
-- Subprocesses launched by tools, external APIs, background traffic, and inference paths outside `turn.step` are not covered. Interactions with other mods require testing; another mod may change middleware behavior.
+- Detached background tool processes, external APIs, background traffic, and inference paths outside `turn.step` are not covered. Foreground ordinary tool execution retains its agent slot; a subprocess that outlives its tool call is not a separate admitted agent. Waiting implemented through arbitrary shell polling cannot be recognized as a child wait and may cause a stall. Tools called outside an admitted turn are denied; plugins that invoke tools independently may be incompatible. Interactions with other mods require testing; another mod may change middleware behavior.
 - macOS with the native Claude executable is the initial supported platform. Linux has core CI coverage; native Linux integration is experimental. Windows and npm/Node-hosted Claude are not supported in this beta.
 - Closed/dead sessions are reaped on the next coordinator operation. The read-only badge can temporarily show stale occupancy. Do not delete the database while sessions are active: that can admit excess work.
 
@@ -102,13 +108,13 @@ On macOS, process inspection uses `/usr/lib/libproc.dylib` without another subpr
 
 ### Data, destinations, and credentials
 
-The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, or `release`), pool, session ID, turn ID, ticket key (including agent ID and step index), and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
+The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, or `release`), the single `agent` pool, session ID, turn ID, ticket key (including agent ID and admission generation), and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
 
 `guard.py` reads/writes `config.json`, `queue.sqlite3` (including SQLite journal files), and local lock/temporary files under `~/.local/state/slot-guard`, or the explicitly configured `CLAUDE_SLOT_HOME`. Stored records contain coordination identifiers, ownership, state, sequence, and creation timestamps. Released records persist until their owner exits and a subsequent coordinator operation reaps them. State remains after uninstall; remove it only after all participating sessions have stopped.
 
 The coordinator and badge reader make **no network requests** and have no remote data destination. They do not read project files, transcript files, Claude's credential store, Keychain, API keys, or authentication tokens. Child processes inherit an OS environment normally; the coordinator does not look up or use credential variables. The only environment setting it explicitly reads is `CLAUDE_SLOT_HOME` (home-directory resolution also uses standard OS/Python behavior).
 
-The `turn.step` middleware receives a turn event and passes it to `next(e)` only after admission. It forwards stream chunks without inspecting or persisting prompts, answers, or tool results. This allows Claude's normal model request to proceed; it does not add a second request or send conversation content to the coordinator. `session.start` registers `/slots`; `command.run` handles only that local command; `turn.complete` releases a main-turn reservation. No additional model tools or agents are registered.
+The `turn.step` middleware receives a turn event and passes it to `next(e)` only after admission. It forwards stream chunks without inspecting or persisting prompts, answers, or tool results. This allows Claude's normal model request to proceed; it does not add a second request or send conversation content to the coordinator. `session.start` registers `/slots`; `command.run` handles only that local command; `turn.complete` releases the corresponding agent reservation after outstanding ordinary work settles. `tool.call` gates ordinary tools, tracks parallel work, and yields a parent reservation during child waits. All work shares the same pool. No additional model tools or agents are registered.
 
 ### Optional statusline and development-only commands
 

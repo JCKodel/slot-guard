@@ -24,6 +24,7 @@ jobs:
           node-version: '22'
       - run: python3 -m unittest discover -s tests -p test_queue.py -v
       - run: python3 -m unittest discover -s tests -p test_packaging.py -v
+      - run: python3 -m unittest discover -s tests -p test_migration.py -v
       - run: node --test tests/mod.test.mjs
       - run: python3 scripts/package.py
       - uses: actions/upload-artifact@v4

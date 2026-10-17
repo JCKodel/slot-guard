@@ -7,7 +7,7 @@ async function drain(stream) {
   for (;;) {const next = await stream.next(); if (next.done) return next.value}
 }
 
-test('real runtime: no inference without two grants', async ($, on) => {
+test('real runtime: no inference without an agent grant', async ($, on) => {
   on('session.id', () => ({value:'test-session'}))
   const calls = []
   let model = 0
@@ -18,7 +18,7 @@ test('real runtime: no inference without two grants', async ($, on) => {
   on('turn.step', async function* () {model++; return RESULT})
   await drain($.turn.step(STEP))
   expect(model).toBe(1)
-  expect(calls.map(d=>d.op+':'+d.pool)).toEqual(['acquire:job','acquire:request','release:request'])
+  expect(calls.map(d=>d.op+':'+d.pool)).toEqual(['acquire:agent'])
 })
 
 test('real runtime: broken coordinator fails closed', async ($, on) => {
@@ -54,8 +54,8 @@ test('real runtime: failed abort still never falls through to model', async ($, 
 
 test('real runtime: slots command reports local occupancy without inference', async ($, on) => {
   on('process.run', () => ({value:{exitCode:0,stderr:'',stdout:JSON.stringify({
-    limits:{job:4,request:4},tickets:[{pool:'job',state:'granted'},{pool:'job',state:'queued'}]
+    limits:{agent:4},tickets:[{pool:'agent',state:'granted'},{pool:'agent',state:'queued'}]
   })}}))
   const result = await $.command.run({command:'slots',args:''})
-  expect(result.text).toBe('Global slots (FIFO):\njob: 1/4 occupied; 1 waiting\nrequest: 0/4 occupied; 0 waiting')
+  expect(result.text).toBe('Agents: 1/4 working; 1 waiting (FIFO). Parents waiting only for children yield their slot.')
 })

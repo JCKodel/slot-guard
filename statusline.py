@@ -18,7 +18,7 @@ def slot_bar(label, used, limit):
 def badge(home, session):
     db = home / 'queue.sqlite3'
     if not db.exists():
-        return 'Slots —'
+        return 'Agents —'
     try:
         limits = json.loads((home / 'config.json').read_text())
         with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True, timeout=.1)) as conn:
@@ -32,14 +32,11 @@ def badge(home, session):
         positions = {}
         for pool, position in rows:
             positions.setdefault(pool, position)
-        labels = {'job':'turn', 'request':'inference'}
-        summary = 'Slots ' + slot_bar('T', used.get('job', 0), limits['jobs'])
-        summary += ' ' + slot_bar('I', used.get('request', 0), limits['requests'])
-        waiting = ' · '.join('⌛ ' + labels[p] + ' #' + str(n)
-                             for p,n in positions.items() if p in labels)
+        summary = slot_bar('Agents', used.get('agent', 0), limits['agents'])
+        waiting = ' · '.join('⌛ #' + str(n) for p,n in positions.items() if p == 'agent')
         return summary + (' · ' + waiting if waiting else '')
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
-        return 'Slots —'  # Display failures never alter admission.
+        return 'Agents —'  # Display failures never alter admission.
 
 
 if __name__ == '__main__':
