@@ -1,0 +1,56 @@
+name: Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.10', '3.14']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -s tests -p test_queue.py -v
+      - run: python3 -m unittest discover -s tests -p test_packaging.py -v
+      - run: node --test tests/mod.test.mjs
+      - run: python3 scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os }}-${{ matrix.python }}
+          path: dist/
+  native-claude:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      DISABLE_AUTOUPDATER: '1'
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+      ANTHROPIC_API_KEY: local-test-not-a-key
+      ANTHROPIC_BASE_URL: http://127.0.0.1:1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install pinned native Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh -o "$RUNNER_TEMP/claude-install.sh"
+          bash "$RUNNER_TEMP/claude-install.sh" 2.1.302
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: claude --version
+      - run: claude plugin validate --strict .
+      - run: claude plugin validate --strict .claude-plugin/plugin.json
+      - run: claude plugin test .
+      - run: python3 -m unittest discover -s tests -p test_integration.py -v
+      - run: python3 scripts/smoke_install.py

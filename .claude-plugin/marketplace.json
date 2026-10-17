@@ -1,0 +1,15 @@
+{
+  "name": "slot-guard",
+  "owner": {
+    "name": "JCKodel"
+  },
+  "plugins": [
+    {
+      "name": "slot-guard",
+      "source": "./"
+    }
+  ],
+  "metadata": {
+    "description": "Local FIFO concurrency control for Claude Code"
+  }
+}

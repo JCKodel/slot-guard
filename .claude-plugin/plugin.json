@@ -1,0 +1,18 @@
+{
+  "name": "slot-guard",
+  "version": "0.2.0-beta.1",
+  "description": "Machine-wide FIFO concurrency slots for Claude Code turns and inference. Local coordination, no daemon.",
+  "author": {
+    "name": "J.C.K\u00f6del",
+    "url": "https://github.com/JCKodel"
+  },
+  "homepage": "https://github.com/JCKodel/slot-guard",
+  "repository": "https://github.com/JCKodel/slot-guard",
+  "license": "AGPL-3.0-only",
+  "keywords": [
+    "concurrency",
+    "fifo",
+    "slots",
+    "cost-control"
+  ]
+}

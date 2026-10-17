@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.test-state/
+.build/
+dist/
+*.sqlite3*
+*.debug.log

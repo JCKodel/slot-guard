@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Local, durable FIFO semaphore. Standard library only; macOS/Linux.
+
+No prompt text, credentials or model responses are accepted or stored.
+Reservations never expire: only explicit release or confirmed owner death frees them.
+"""
+import argparse
+import ctypes
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+
+DEFAULT_HOME = Path.home() / '.local/state/slot-guard'
+MAX_MESSAGE = 16384
+
+
+class BSDInfo(ctypes.Structure):
+    # macOS SDK sys/proc_info.h, PROC_PIDTBSDINFO = 3.
+    _fields_ = [(k, ctypes.c_uint32) for k in (
+        'flags', 'status', 'xstatus', 'pid', 'ppid', 'uid', 'gid', 'ruid',
+        'rgid', 'svuid', 'svgid', 'reserved')]
+    _fields_ += [('comm', ctypes.c_char * 16), ('name', ctypes.c_char * 32)]
+    _fields_ += [(k, ctypes.c_uint32) for k in ('nfiles','pgid','pjobc','tdev','tpgid')]
+    _fields_ += [('nice',ctypes.c_int32), ('seconds',ctypes.c_uint64), ('micros',ctypes.c_uint64)]
+
+
+def mac_process(pid):
+    lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    info = BSDInfo()
+    ctypes.set_errno(0)
+    n = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if n == 0 and ctypes.get_errno() == errno.ESRCH:
+        return None
+    if n != ctypes.sizeof(info):
+        raise RuntimeError('Cannot inspect process; retaining reservations')
+    return info
+
+
+def process_identity(pid):
+    """Return start identity; None only for confirmed absence/zombie, raise on errors."""
+    if sys.platform == 'darwin':
+        info = mac_process(pid)
+        if info is None or info.status == 5:  # SZOMB
+            return None
+        return str(info.seconds) + ':' + str(info.micros)
+    if sys.platform.startswith('linux'):
+        try:
+            stat = Path(f'/proc/{pid}/stat').read_text()
+        except FileNotFoundError:
+            return None
+        fields = stat[stat.rindex(')') + 2:].split()
+        if fields[0] == 'Z':
+            return None
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip() + ':' + fields[19]
+    p = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'lstart=', '-o', 'stat='],
+                       capture_output=True, text=True, timeout=3,
+                       env={**os.environ, 'LC_ALL': 'C'})
+    if p.returncode == 1 and not p.stdout.strip() and not p.stderr.strip():
+        return None
+    if p.returncode != 0:
+        raise RuntimeError('Cannot inspect process; retaining reservations')
+    fields = p.stdout.split()
+    if len(fields) < 6:
+        raise RuntimeError('Invalid process identity; retaining reservations')
+    if fields[-1].startswith('Z'):
+        return None
+    return ' '.join(fields[:-1])
+
+
+def claude_owner():
+    pid = os.getppid()
+    for _ in range(12):
+        if sys.platform == 'darwin':
+            info = mac_process(pid)
+            if info is None:
+                break
+            lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+            path = ctypes.create_string_buffer(4096)
+            n = lib.proc_pidpath(pid, path, len(path))
+            if n <= 0:
+                raise RuntimeError('Cannot identify Claude ancestor')
+            command = path.value.decode()
+            parent = info.ppid
+        else:
+            p = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'ppid=', '-o', 'comm='],
+                               capture_output=True, text=True, timeout=3)
+            parts = p.stdout.strip().split(None, 1)
+            if len(parts) != 2:
+                break
+            parent, command = parts
+        name = Path(command).name
+        # Native Claude executable can be named by its version in ~/.local/share/claude/versions.
+        if name == 'claude' or '/claude/versions/' in command:
+            birth = process_identity(pid)
+            if birth:
+                return {'pid': pid, 'birth': birth}
+        pid = int(parent)
+        if pid <= 1:
+            break
+    raise RuntimeError('Claude parent process not found; refusing unowned admission')
+
+
+class Queue:
+    def __init__(self, db, jobs=4, requests=4, identity=process_identity):
+        if any(type(n) is not int or n < 1 for n in (jobs, requests)):
+            raise ValueError('Limits must be positive integers')
+        self.identity = identity
+        self.limits = {'job': jobs, 'request': requests}
+        self.condition = threading.Condition(threading.RLock())
+        self.db = sqlite3.connect(db, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA synchronous=FULL')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS tickets (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL,
+            pool TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL,
+            pid INTEGER NOT NULL, birth TEXT NOT NULL, state TEXT NOT NULL,
+            created REAL NOT NULL)''')
+        self.db.commit()
+
+    def reap(self):
+        with self.condition, self.db:
+            owners = self.db.execute('SELECT DISTINCT pid,birth FROM tickets').fetchall()
+            for owner in owners:
+                try:
+                    alive = self.identity(owner['pid'])
+                except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                    continue  # Unknown is not dead.
+                if alive != owner['birth']:
+                    self.db.execute('DELETE FROM tickets WHERE pid=? AND birth=?', tuple(owner))
+            self._promote()
+            self.condition.notify_all()
+
+    def _promote(self):
+        for pool, limit in self.limits.items():
+            used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (pool,)).fetchone()[0]
+            free = max(0, limit - used)
+            self.db.execute("""UPDATE tickets SET state='granted' WHERE seq IN
+                (SELECT seq FROM tickets WHERE pool=? AND state='queued' ORDER BY seq LIMIT ?)""", (pool, free))
+
+    @staticmethod
+    def validate(data):
+        if data.get('pool') not in ('job', 'request'):
+            raise ValueError('Invalid pool')
+        for key in ('key', 'session', 'turn', 'birth'):
+            if not isinstance(data.get(key), str) or not 0 < len(data[key]) <= 512:
+                raise ValueError('Invalid ' + key)
+        if type(data.get('pid')) is not int or data['pid'] <= 1:
+            raise ValueError('Invalid owner pid')
+
+    def operate(self, data):
+        op = data.get('op')
+        if op == 'status':
+            with self.condition:
+                return {'limits': self.limits, 'tickets': [dict(r) for r in self.db.execute(
+                    "SELECT seq,pool,session,turn,pid,state FROM tickets WHERE state!='released' ORDER BY seq")]}
+        if op not in ('acquire', 'release', 'finish'):
+            raise ValueError('Unknown operation')
+        self.validate(data)
+        values = tuple(data[k] for k in ('key', 'pool', 'session', 'turn', 'pid', 'birth'))
+        with self.condition:
+            with self.db:
+                row = self.db.execute('SELECT * FROM tickets WHERE key=?', (data['key'],)).fetchone()
+                if row and tuple(row[k] for k in ('key','pool','session','turn','pid','birth')) != values:
+                    raise ValueError('Ticket belongs to a different operation')
+                if op == 'acquire':
+                    if self.identity(data['pid']) != data['birth']:
+                        raise ValueError('Owner is not alive')
+                    self.db.execute('INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES(?,?,?,?,?,?,?,?)',
+                                    (*values, 'queued', time.time()))
+                elif op == 'release':
+                    # Tombstone prevents a delayed acquire from resurrecting canceled work.
+                    self.db.execute('INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES(?,?,?,?,?,?,?,?)',
+                                    (*values, 'released', time.time()))
+                    self.db.execute("UPDATE tickets SET state='released' WHERE key=?", (data['key'],))
+                elif op == 'finish':
+                    # Only the main job. Do not free outstanding inference slots here.
+                    self.db.execute("UPDATE tickets SET state='released' WHERE pool='job' AND session=? AND turn=? AND pid=? AND birth=?",
+                                    (data['session'], data['turn'], data['pid'], data['birth']))
+                self._promote()
+            self.condition.notify_all()
+            if op != 'acquire':
+                return {'state': 'released'}
+            deadline = time.monotonic() + min(20, max(0, float(data.get('wait', 0))))
+            while True:
+                row = self.db.execute('SELECT seq,state FROM tickets WHERE key=?', (data['key'],)).fetchone()
+                if not row:
+                    return {'state': 'released'}
+                if row['state'] != 'queued' or time.monotonic() >= deadline:
+                    position = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='queued' AND seq<=?", (data['pool'],row['seq'])).fetchone()[0]
+                    return {'state': row['state'], 'ticket': row['seq'], 'position': position}
+                self.condition.wait(min(1, deadline-time.monotonic()))
+
+
+def local_call(home, data):
+    """One transaction at a time across processes, with a stable ticket while waiting."""
+    deadline = time.monotonic() + min(20, max(0, float(data.get('wait', 0))))
+    while True:
+        with (home/'coordinator.lock').open('a') as lock:
+            lock_deadline = time.monotonic() + 3
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= lock_deadline:
+                        raise RuntimeError('Coordinator lock timeout; admission refused')
+                    time.sleep(0.025)
+            config = json.loads((home/'config.json').read_text())
+            q = Queue(home/'queue.sqlite3', config['jobs'], config['requests'])
+            try:
+                q.reap()
+                result = q.operate({**data, 'wait': 0})
+            finally:
+                q.db.close()
+        if result.get('state') != 'queued' or time.monotonic() >= deadline:
+            return result
+        time.sleep(min(0.25, max(0, deadline-time.monotonic())))
+
+
+def initialize(home, jobs, requests, replace=False):
+    if any(type(n) is not int or n < 1 for n in (jobs, requests)):
+        raise ValueError('Limits must be positive integers')
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(home, 0o700)
+    with (home/'initialize.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        config = home/'config.json'
+        if replace or not config.exists():
+            if not replace and (home/'queue.sqlite3').exists():
+                raise RuntimeError('Missing configuration for existing queue; admission refused')
+            temporary = home/'config.json.tmp'
+            with temporary.open('w') as f:
+                json.dump({'jobs': jobs, 'requests': requests}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            temporary.replace(config)
+    return local_call(home, {'op':'status'})
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--home', type=Path, default=Path(os.environ.get('CLAUDE_SLOT_HOME', DEFAULT_HOME)))
+    sub = p.add_subparsers(dest='command', required=True)
+    s = sub.add_parser('init')
+    s.add_argument('--jobs', type=int, default=4)
+    s.add_argument('--requests', type=int, default=4)
+    c = sub.add_parser('configure')
+    c.add_argument('--jobs', type=int, required=True)
+    c.add_argument('--requests', type=int, required=True)
+    sub.add_parser('status')
+    sub.add_parser('client')
+    args = p.parse_args()
+    os.umask(0o077)
+    if args.command == 'init':
+        print(json.dumps(initialize(args.home, args.jobs, args.requests), indent=2))
+    elif args.command == 'configure':
+        print(json.dumps(initialize(args.home, args.jobs, args.requests, replace=True), indent=2))
+    elif args.command == 'status':
+        print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
+    else:
+        initialize(args.home, 4, 4)
+        data = json.loads(sys.stdin.read(MAX_MESSAGE))
+        if data.get('op') != 'status':
+            data.update(claude_owner())
+        print(json.dumps(local_call(args.home, data)))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
