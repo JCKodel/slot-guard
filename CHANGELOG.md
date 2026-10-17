@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0-beta.1
+
+- Slots can no longer be held forever by a living Claude process:
+  - A lease: the mod renews its tickets every 30 s; the coordinator releases tickets not renewed for 5 minutes.
+  - Tickets held but unused for 2 minutes are released by the mod (covers a turn whose end was never reported).
+  - Failed releases are retried at the next step, at turn end and by the heartbeat, instead of being lost.
+  - A reloaded or updated mod releases the tickets of its previous load.
+  - `/slots evict N` and `guard.py evict N` free a ticket by hand; `/slots` lists tickets with their renewal age.
+- Waiting on the person no longer holds a slot: permission prompts (`tool.check` asks), `AskUserQuestion` and `ExitPlanMode` yield.
+- A `Bash` command that runs `claude` yields, avoiding deadlock with the nested session's own slot.
+- Agent state is keyed by agent, not session ID, so `/clear` cannot orphan a running agent's slot.
+- A new turn closes a previous turn whose completion was never reported, instead of aborting every later turn.
+- The `tool.call` fallback no longer reports an already executed tool as denied.
+- Coordinator lock contention keeps an acquirer waiting instead of aborting its turn.
+- Released tombstones are pruned after one hour; the unused in-process long-poll was removed.
+- Schema migrates in place (`touched`, `instance` columns); rows of older clients keep their old never-expire semantics.
+
 ## 0.3.0-beta.1
 
 - Replace turn/inference pools with one global working-agent pool shared by main agents and subagents.

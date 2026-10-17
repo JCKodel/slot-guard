@@ -27,7 +27,7 @@ class MigrationTests(unittest.TestCase):
             home=Path(tmp);self.legacy(home)
             with patch('guard.process_identity',return_value=None):
                 result=initialize(home)
-            self.assertEqual(result,{'limits':{'agent':3},'tickets':[]})
+            self.assertEqual(result,{'limits':{'agent':3},'lease':300,'tickets':[]})
             self.assertEqual(json.loads((home/'config.json').read_text()),{'agents':3,'schema':2})
 
     def test_unknown_legacy_owner_refuses_migration(self):

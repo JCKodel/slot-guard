@@ -54,8 +54,11 @@ test('real runtime: failed abort still never falls through to model', async ($, 
 
 test('real runtime: slots command reports local occupancy without inference', async ($, on) => {
   on('process.run', () => ({value:{exitCode:0,stderr:'',stdout:JSON.stringify({
-    limits:{agent:4},tickets:[{pool:'agent',state:'granted'},{pool:'agent',state:'queued'}]
+    limits:{agent:4},tickets:[
+      {seq:7,pool:'agent',state:'granted',session:'0123456789',pid:42,idle:3},
+      {seq:8,pool:'agent',state:'queued',session:'abcdefghij',pid:43,idle:0}]
   })}}))
   const result = await $.command.run({command:'slots',args:''})
-  expect(result.text).toBe('Agents: 1/4 working; 1 waiting (FIFO). Parents waiting only for children yield their slot.')
+  expect(result.text).toBe(['Agents: 1/4 working; 1 waiting (FIFO). Parents waiting only for children yield their slot.',
+    '#7 granted session 01234567 pid 42, renewed 3s ago','#8 queued session abcdefgh pid 43, renewed 0s ago'].join('\n'))
 })

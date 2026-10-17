@@ -49,13 +49,14 @@ class IntegrationTests(unittest.TestCase):
             time.sleep(.05)
         self.fail('Timed out waiting for condition')
 
-    def claude(self, delay=.1, home=None, children=False, stream=False, mode=""):
+    def claude(self, delay=.1, home=None, children=False, stream=False, mode="", heartbeat=None):
         sid=str(uuid.uuid4())
         home=home or self.home
         env={**test_environment(),'CLAUDE_SLOT_HOME':str(home),'SLOT_TEST_DELAY':str(delay),
              'SLOT_TEST_CHILDREN':'1' if children else '0', 'SLOT_TEST_MODE':mode,
              'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1',
              'ANTHROPIC_API_KEY':'local-test-not-a-key', 'ANTHROPIC_BASE_URL':'http://127.0.0.1:1'}
+        if heartbeat: env['SLOT_HEARTBEAT_MS']=str(heartbeat)
         command=[shutil.which('claude'),'-p','Local test, no inference.',
             '--plugin-dir',str(ROOT),'--plugin-dir',str(ROOT/'tests/fixtures/fake-model'),
             '--setting-sources','','--strict-mcp-config','--tools','Agent,Bash' if children or mode=='tools' else '',
@@ -164,8 +165,10 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
         import fcntl
         with (self.home/'coordinator.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
+            # Contention keeps an acquirer waiting; it never grants or records a ticket.
+            self.assertEqual(local_call(self.home,self.ticket('blocked'))['state'],'queued')
             with self.assertRaisesRegex(RuntimeError,'lock timeout'):
-                local_call(self.home,self.ticket('blocked'))
+                local_call(self.home,self.ticket('blocked',op='release'))
         self.assertEqual(self.status(),[])
 
     def test_actual_subagents_share_one_free_slot_with_three_existing_agents(self):
@@ -209,6 +212,25 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
             self.assertEqual(r['subagent_stats']['completed'],3)
         self.assertEqual(self.status(),[])
         print('Four parents / twelve children completed; peak working agents:',peak,flush=True)
+
+    def test_heartbeat_renews_lease_of_long_running_work(self):
+        sid,p=self.claude(delay=4,heartbeat=500)
+        renewals=set()
+        end=time.monotonic()+20
+        while p.poll() is None and time.monotonic()<end:
+            try:
+                db=sqlite3.connect(self.home/'queue.sqlite3')
+                try:
+                    rows=db.execute("SELECT touched FROM tickets WHERE session=? AND state='granted'",(sid,)).fetchall()
+                finally:
+                    db.close()
+            except sqlite3.Error:
+                rows=[]
+            renewals.update(r[0] for r in rows)
+            time.sleep(.1)
+        self.result(p)
+        # The step held its slot for 4 s; the real engine's timer must have renewed it meanwhile.
+        self.assertGreaterEqual(len(renewals),3,renewals)
 
     def test_interrupt_waiting_turn_keeps_session_usable(self):
         for i in range(4): local_call(self.home,self.ticket(str(i)))

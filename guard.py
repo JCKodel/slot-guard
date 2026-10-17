@@ -2,7 +2,8 @@
 """Local, durable FIFO semaphore. Standard library only; macOS/Linux.
 
 No prompt text, credentials or model responses are accepted or stored.
-Reservations never expire: only explicit release or confirmed owner death frees them.
+Reservations end by explicit release, confirmed owner death, eviction, or an
+expired lease: a mod instance renews its tickets while it is working on them.
 """
 import argparse
 import ctypes
@@ -19,6 +20,9 @@ import time
 
 DEFAULT_HOME = Path.home() / '.local/state/slot-guard'
 MAX_MESSAGE = 16384
+LEASE = 300  # Seconds without renewal before a heartbeating ticket is abandoned.
+TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
+LIVE = "state IN ('queued','granted')"
 
 
 class BSDInfo(ctypes.Structure):
@@ -108,12 +112,13 @@ def claude_owner():
 
 
 class Queue:
-    def __init__(self, db, agents=4, identity=process_identity):
-        if any(type(n) is not int or n < 1 for n in (agents,)):
+    def __init__(self, db, agents=4, identity=process_identity, lease=LEASE):
+        if any(type(n) is not int or n < 1 for n in (agents, lease)):
             raise ValueError('Limits must be positive integers')
         self.identity = identity
         self.limits = {'agent': agents}
-        self.condition = threading.Condition(threading.RLock())
+        self.lease = lease
+        self.lock = threading.RLock()  # One connection, shared by threads in tests and tools.
         self.db = sqlite3.connect(db, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
@@ -122,11 +127,17 @@ class Queue:
             seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL,
             pool TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL,
             pid INTEGER NOT NULL, birth TEXT NOT NULL, state TEXT NOT NULL,
-            created REAL NOT NULL)''')
+            created REAL NOT NULL, touched REAL, instance TEXT NOT NULL DEFAULT '')''')
+        columns = {r['name'] for r in self.db.execute('PRAGMA table_info(tickets)')}
+        # Older clients may share this database: their rows keep instance '' and never expire.
+        if 'touched' not in columns:
+            self.db.execute('ALTER TABLE tickets ADD COLUMN touched REAL')
+        if 'instance' not in columns:
+            self.db.execute("ALTER TABLE tickets ADD COLUMN instance TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     def reap(self):
-        with self.condition, self.db:
+        with self.lock, self.db:
             owners = self.db.execute('SELECT DISTINCT pid,birth FROM tickets').fetchall()
             for owner in owners:
                 try:
@@ -135,8 +146,13 @@ class Queue:
                     continue  # Unknown is not dead.
                 if alive != owner['birth']:
                     self.db.execute('DELETE FROM tickets WHERE pid=? AND birth=?', tuple(owner))
+            now = time.time()
+            # A live owner can still lose track of a ticket (failed release, reloaded mod).
+            self.db.execute(f"""UPDATE tickets SET state='released', touched=? WHERE {LIVE}
+                AND instance!='' AND coalesce(touched,created)<?""", (now, now - self.lease))
+            self.db.execute("DELETE FROM tickets WHERE state='released' AND coalesce(touched,created)<?",
+                            (now - TOMBSTONE,))
             self._promote()
-            self.condition.notify_all()
 
     def _promote(self):
         for pool, limit in self.limits.items():
@@ -146,59 +162,104 @@ class Queue:
                 (SELECT seq FROM tickets WHERE pool=? AND state='queued' ORDER BY seq LIMIT ?)""", (pool, free))
 
     @staticmethod
-    def validate(data):
-        if data.get('pool') != 'agent':
-            raise ValueError('Invalid pool')
-        for key in ('key', 'session', 'turn', 'birth'):
-            if not isinstance(data.get(key), str) or not 0 < len(data[key]) <= 512:
-                raise ValueError('Invalid ' + key)
+    def validate_owner(data):
+        if not isinstance(data.get('birth'), str) or not 0 < len(data['birth']) <= 512:
+            raise ValueError('Invalid birth')
         if type(data.get('pid')) is not int or data['pid'] <= 1:
             raise ValueError('Invalid owner pid')
 
+    @classmethod
+    def validate(cls, data):
+        if data.get('pool') != 'agent':
+            raise ValueError('Invalid pool')
+        for key in ('key', 'session', 'turn'):
+            if not isinstance(data.get(key), str) or not 0 < len(data[key]) <= 512:
+                raise ValueError('Invalid ' + key)
+        if not isinstance(data.get('instance', ''), str) or len(data.get('instance', '')) > 64:
+            raise ValueError('Invalid instance')
+        cls.validate_owner(data)
+
     def operate(self, data):
+        with self.lock:
+            return self._operate(data)
+
+    def _operate(self, data):
         op = data.get('op')
         if op == 'status':
-            with self.condition:
-                return {'limits': self.limits, 'tickets': [dict(r) for r in self.db.execute(
-                    "SELECT seq,pool,session,turn,pid,state FROM tickets WHERE state!='released' ORDER BY seq")]}
+            now = time.time()
+            return {'limits': self.limits, 'lease': self.lease, 'tickets': [
+                {**dict(r), 'idle': round(now - r['seen'])} for r in self.db.execute(
+                    f"""SELECT seq,pool,session,turn,pid,state,coalesce(touched,created) AS seen
+                    FROM tickets WHERE {LIVE} ORDER BY seq""")]}
+        if op == 'evict':
+            seqs = data.get('seqs')
+            if not isinstance(seqs, list) or not 0 < len(seqs) <= 64 or any(type(n) is not int for n in seqs):
+                raise ValueError('Invalid ticket numbers')
+            with self.db:
+                marks = ','.join('?' * len(seqs))
+                n = self.db.execute(f"UPDATE tickets SET state='released', touched=? WHERE {LIVE} AND seq IN ({marks})",
+                                    (time.time(), *seqs)).rowcount
+                self._promote()
+            return {'evicted': n}
+        if op == 'touch':
+            self.validate_owner(data)
+            keys = data.get('keys')
+            if not isinstance(keys, list) or len(keys) > 256 or any(
+                    not isinstance(k, str) or not 0 < len(k) <= 512 for k in keys):
+                raise ValueError('Invalid keys')
+            with self.db:
+                states = {}
+                for key in keys:
+                    self.db.execute(f'UPDATE tickets SET touched=? WHERE key=? AND pid=? AND birth=? AND {LIVE}',
+                                    (time.time(), key, data['pid'], data['birth']))
+                    row = self.db.execute('SELECT state FROM tickets WHERE key=? AND pid=? AND birth=?',
+                                          (key, data['pid'], data['birth'])).fetchone()
+                    states[key] = row['state'] if row else 'released'
+            return {'states': states}
+        if op == 'adopt':
+            # A reloaded mod abandons every ticket its previous load held in this process.
+            self.validate_owner(data)
+            if not isinstance(data.get('instance'), str) or not 0 < len(data['instance']) <= 64:
+                raise ValueError('Invalid instance')
+            with self.db:
+                n = self.db.execute(f"""UPDATE tickets SET state='released', touched=? WHERE {LIVE}
+                    AND pid=? AND birth=? AND instance!='' AND instance!=?""",
+                    (time.time(), data['pid'], data['birth'], data['instance'])).rowcount
+                self._promote()
+            return {'released': n}
         if op not in ('acquire', 'release'):
             raise ValueError('Unknown operation')
         self.validate(data)
         values = tuple(data[k] for k in ('key', 'pool', 'session', 'turn', 'pid', 'birth'))
-        with self.condition:
-            with self.db:
-                row = self.db.execute('SELECT * FROM tickets WHERE key=?', (data['key'],)).fetchone()
-                if row and tuple(row[k] for k in ('key','pool','session','turn','pid','birth')) != values:
-                    raise ValueError('Ticket belongs to a different operation')
-                if op == 'acquire':
-                    if self.identity(data['pid']) != data['birth']:
-                        raise ValueError('Owner is not alive')
-                    self.db.execute('INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES(?,?,?,?,?,?,?,?)',
-                                    (*values, 'queued', time.time()))
-                elif op == 'release':
-                    # Tombstone prevents a delayed acquire from resurrecting canceled work.
-                    self.db.execute('INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES(?,?,?,?,?,?,?,?)',
-                                    (*values, 'released', time.time()))
-                    self.db.execute("UPDATE tickets SET state='released' WHERE key=?", (data['key'],))
-                self._promote()
-            self.condition.notify_all()
-            if op != 'acquire':
-                return {'state': 'released'}
-            deadline = time.monotonic() + min(20, max(0, float(data.get('wait', 0))))
-            while True:
-                row = self.db.execute('SELECT seq,state FROM tickets WHERE key=?', (data['key'],)).fetchone()
-                if not row:
-                    return {'state': 'released'}
-                if row['state'] != 'queued' or time.monotonic() >= deadline:
-                    position = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='queued' AND seq<=?", (data['pool'],row['seq'])).fetchone()[0]
-                    return {'state': row['state'], 'ticket': row['seq'], 'position': position}
-                self.condition.wait(min(1, deadline-time.monotonic()))
+        now = time.time()
+        with self.db:
+            row = self.db.execute('SELECT * FROM tickets WHERE key=?', (data['key'],)).fetchone()
+            if row and tuple(row[k] for k in ('key','pool','session','turn','pid','birth')) != values:
+                raise ValueError('Ticket belongs to a different operation')
+            insert = 'INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created,touched,instance) VALUES(?,?,?,?,?,?,?,?,?,?)'
+            if op == 'acquire':
+                if self.identity(data['pid']) != data['birth']:
+                    raise ValueError('Owner is not alive')
+                self.db.execute(insert, (*values, 'queued', now, now, data.get('instance', '')))
+                self.db.execute(f'UPDATE tickets SET touched=? WHERE key=? AND {LIVE}', (now, data['key']))
+            else:
+                # Tombstone prevents a delayed acquire from resurrecting canceled work.
+                self.db.execute(insert, (*values, 'released', now, now, data.get('instance', '')))
+                self.db.execute("UPDATE tickets SET state='released', touched=? WHERE key=?", (now, data['key']))
+            self._promote()
+        if op != 'acquire':
+            return {'state': 'released'}
+        row = self.db.execute('SELECT seq,state FROM tickets WHERE key=?', (data['key'],)).fetchone()
+        position = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='queued' AND seq<=?",
+                                   (data['pool'], row['seq'])).fetchone()[0]
+        return {'state': row['state'], 'ticket': row['seq'], 'position': position}
 
 
 def local_call(home, data):
     """One transaction at a time across processes, with a stable ticket while waiting."""
     deadline = time.monotonic() + min(20, max(0, float(data.get('wait', 0))))
     while True:
+        result = None
         with (home/'coordinator.lock').open('a') as lock:
             lock_deadline = time.monotonic() + 3
             while True:
@@ -207,15 +268,20 @@ def local_call(home, data):
                     break
                 except BlockingIOError:
                     if time.monotonic() >= lock_deadline:
-                        raise RuntimeError('Coordinator lock timeout; admission refused')
+                        if data.get('op') != 'acquire':
+                            raise RuntimeError('Coordinator lock timeout')
+                        # Contention is not refusal: an acquirer keeps waiting its turn.
+                        result = {'state': 'queued', 'position': None}
+                        break
                     time.sleep(0.025)
-            config = json.loads((home/'config.json').read_text())
-            q = Queue(home/'queue.sqlite3', config['agents'])
-            try:
-                q.reap()
-                result = q.operate({**data, 'wait': 0})
-            finally:
-                q.db.close()
+            if result is None:
+                config = json.loads((home/'config.json').read_text())
+                q = Queue(home/'queue.sqlite3', config['agents'], lease=config.get('lease', LEASE))
+                try:
+                    q.reap()
+                    result = q.operate(data)
+                finally:
+                    q.db.close()
         if result.get('state') != 'queued' or time.monotonic() >= deadline:
             return result
         time.sleep(min(0.25, max(0, deadline-time.monotonic())))
@@ -269,6 +335,8 @@ def main():
     c = sub.add_parser('configure')
     c.add_argument('--agents', type=int, required=True)
     sub.add_parser('status')
+    e = sub.add_parser('evict', help='Release tickets by number, as listed by status or /slots')
+    e.add_argument('seqs', type=int, nargs='+')
     sub.add_parser('client')
     args = p.parse_args()
     os.umask(0o077)
@@ -278,10 +346,12 @@ def main():
         print(json.dumps(initialize(args.home, args.agents, replace=True), indent=2))
     elif args.command == 'status':
         print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
+    elif args.command == 'evict':
+        print(json.dumps(local_call(args.home, {'op':'evict', 'seqs':args.seqs}), indent=2))
     else:
         initialize(args.home)
         data = json.loads(sys.stdin.read(MAX_MESSAGE))
-        if data.get('op') != 'status':
+        if data.get('op') not in ('status', 'evict'):
             data.update(claude_owner())
         print(json.dumps(local_call(args.home, data)))
 

@@ -40,11 +40,12 @@ git clone https://github.com/JCKodel/slot-guard.git
 cd slot-guard
 python3 guard.py configure --agents 4
 python3 guard.py status
+python3 guard.py evict 12      # free ticket #12 by hand
 ```
 
 `--agents` is the single global limit. Four sessions without children, two working parents plus two working children, or one working parent plus three children all use four slots. Idle terminals and parents suspended waiting only for children do not count as working.
 
-A slot spans inference and ordinary tools, not merely an API response. `Agent`/legacy `Task` delegation and blocking `TaskOutput` waits let a parent yield. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
+A slot spans inference and ordinary tools, not merely an API response. An agent yields its slot while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt, and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
 
 ### Upgrading from 0.2.x or the private prototype
 
@@ -81,14 +82,14 @@ The remover preserves unrelated settings and refuses to overwrite a statusline y
 
 - FIFO ordering applies to agent admissions and resumptions, according to the order tickets enter the database. OS scheduling may change when admitted work visibly starts.
 - SQLite transactions plus an OS file lock serialize admission across processes.
-- Reservations do not expire. Explicit release or a confirmed dead owner releases them. PID reuse is checked against process birth identity.
+- A reservation ends by explicit release, by a confirmed dead owner (PID reuse is checked against process birth identity), by eviction (`/slots evict N` or `guard.py evict N`), or by its lease: a running mod renews its tickets every 30 seconds, and a ticket not renewed for 5 minutes is released. A ticket the mod holds without using it for 2 minutes is released by the mod itself. A failed release is retried. Reloading or updating the mod releases the tickets its previous load held. An agent whose ticket was evicted or expired rejoins the back of the queue.
 - If the coordinator fails, the mod aborts the turn without calling the next model handler. Unknown process state retains reservations.
 - Cancellation uses tombstones so a delayed acquire cannot resurrect canceled work. Waiting polls locally and consumes no model tokens.
 - This controls concurrency, **not total tokens, spend, or the Claude usage window**. It does not prevent the same amount of work from eventually consuming the same tokens.
 - Only sessions that load and execute the mod participate. Disabled plugins, other clients, other OS users, and other machines are outside its control. This is not a security boundary or a billing guarantee.
-- Detached background tool processes, external APIs, background traffic, and inference paths outside `turn.step` are not covered. Foreground ordinary tool execution retains its agent slot; a subprocess that outlives its tool call is not a separate admitted agent. Waiting implemented through arbitrary shell polling cannot be recognized as a child wait and may cause a stall. Tools called outside an admitted turn are denied; plugins that invoke tools independently may be incompatible. Interactions with other mods require testing; another mod may change middleware behavior.
+- Detached background tool processes, external APIs, background traffic, and inference paths outside `turn.step` are not covered. Foreground ordinary tool execution retains its agent slot; a subprocess that outlives its tool call is not a separate admitted agent. Waiting implemented through arbitrary shell polling cannot be recognized as a child wait and holds the slot until the command ends. Tools called outside an admitted turn are denied; plugins that invoke tools independently may be incompatible. Interactions with other mods require testing; another mod may change middleware behavior.
 - macOS with the native Claude executable is the initial supported platform. Linux has core CI coverage; native Linux integration is experimental. Windows and npm/Node-hosted Claude are not supported in this beta.
-- Closed/dead sessions are reaped on the next coordinator operation. The read-only badge can temporarily show stale occupancy. Do not delete the database while sessions are active: that can admit excess work.
+- Closed/dead sessions and expired leases are reaped on the next coordinator operation. The read-only badge can temporarily show stale occupancy. Do not delete the database while sessions are active: that can admit excess work.
 
 ## Permissions, data flow, and directory review
 
@@ -108,9 +109,9 @@ On macOS, process inspection uses `/usr/lib/libproc.dylib` without another subpr
 
 ### Data, destinations, and credentials
 
-The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, or `release`), the single `agent` pool, session ID, turn ID, ticket key (including agent ID and admission generation), and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
+The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, `release`, `touch`, `adopt`, or `evict`), the single `agent` pool, session ID, turn ID, ticket key (including mod load ID, agent ID and admission generation), ticket numbers to evict, and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
 
-`guard.py` reads/writes `config.json`, `queue.sqlite3` (including SQLite journal files), and local lock/temporary files under `~/.local/state/slot-guard`, or the explicitly configured `CLAUDE_SLOT_HOME`. Stored records contain coordination identifiers, ownership, state, sequence, and creation timestamps. Released records persist until their owner exits and a subsequent coordinator operation reaps them. State remains after uninstall; remove it only after all participating sessions have stopped.
+`guard.py` reads/writes `config.json`, `queue.sqlite3` (including SQLite journal files), and local lock/temporary files under `~/.local/state/slot-guard`, or the explicitly configured `CLAUDE_SLOT_HOME`. Stored records contain coordination identifiers, ownership, state, sequence, and creation timestamps. Stored records also carry the last renewal time and the mod load that created them. Released records are deleted when their owner exits, or one hour after release. State remains after uninstall; remove it only after all participating sessions have stopped.
 
 The coordinator and badge reader make **no network requests** and have no remote data destination. They do not read project files, transcript files, Claude's credential store, Keychain, API keys, or authentication tokens. Child processes inherit an OS environment normally; the coordinator does not look up or use credential variables. The only environment setting it explicitly reads is `CLAUDE_SLOT_HOME` (home-directory resolution also uses standard OS/Python behavior).
 
