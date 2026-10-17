@@ -44,7 +44,7 @@ python3 guard.py status
 
 `--jobs` limits active **main turns**, including time spent executing their tools. `--requests` limits concurrent **model steps**, including subagents. A model step holds its slot for the complete response stream. A main turn acquires its turn slot before its inference slot. Subagents acquire only inference slots.
 
-Lowering a limit does not interrupt existing work; the queue drains to the new limit. For predictable changes, configure while your sessions are idle. Limits must be positive integers. All participating terminals must run as the same OS user and use the same state path on a local filesystem. Set `CLAUDE_SLOT_HOME` in your shell to override that path; export it consistently in every terminal and the statusline environment.
+Lowering a limit does not interrupt existing work; the queue drains to the new limit. For predictable changes, configure while your sessions are idle. Limits must be positive integers. All participating terminals must run as the same OS user and use the same state path on a local filesystem. Set `CLAUDE_SLOT_HOME` to an absolute path in your shell to override that path; export it consistently in every terminal and the statusline environment.
 
 ## Optional statusline
 
@@ -83,6 +83,42 @@ The remover preserves unrelated settings and refuses to overwrite a statusline y
 - Subprocesses launched by tools, external APIs, background traffic, and inference paths outside `turn.step` are not covered. Interactions with other mods require testing; another mod may change middleware behavior.
 - macOS with the native Claude executable is the initial supported platform. Linux has core CI coverage; native Linux integration is experimental. Windows and npm/Node-hosted Claude are not supported in this beta.
 - Closed/dead sessions are reaped on the next coordinator operation. The read-only badge can temporarily show stale occupancy. Do not delete the database while sessions are active: that can admit excess work.
+
+## Permissions, data flow, and directory review
+
+### Programs executed by the mod
+
+The mod makes one kind of process call, in `hooks/register.js`:
+
+```js
+$.process.run(['python3', 'guard.py', 'client'], {
+  cwd: $.plugin.root, stdin: JSON.stringify(data), timeoutMs: 25000,
+})
+```
+
+Its complete command is the fixed argument vector `python3 guard.py client`, with the working directory set to Claude's trusted `$.plugin.root`. The script path is relative to the installed plugin, never the user's project. All command arguments are literal strings; only the installation working directory varies. Arguments are passed as an array without a shell, inline Python, downloaded code, or a network utility. The bundled `guard.py` coordinates local SQLite reservations. Python is necessary for SQLite, cross-process file locks, and process-liveness inspection using the standard library.
+
+On macOS, process inspection uses `/usr/lib/libproc.dylib` without another subprocess. On Linux, ancestry inspection invokes `/bin/ps -p <pid> -o ppid= -o comm=` and process identity reads `/proc/<pid>/stat` and `/proc/sys/kernel/random/boot_id`. The fallback for other Unix platforms invokes `/bin/ps -p <pid> -o lstart= -o stat=`; those platforms are not supported by this beta. PIDs are derived from the OS, not user text. No command reads process environment variables or full command-line arguments.
+
+### Data, destinations, and credentials
+
+The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, or `release`), pool, session ID, turn ID, ticket key (including agent ID and step index), and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
+
+`guard.py` reads/writes `config.json`, `queue.sqlite3` (including SQLite journal files), and local lock/temporary files under `~/.local/state/slot-guard`, or the explicitly configured `CLAUDE_SLOT_HOME`. Stored records contain coordination identifiers, ownership, state, sequence, and creation timestamps. Released records persist until their owner exits and a subsequent coordinator operation reaps them. State remains after uninstall; remove it only after all participating sessions have stopped.
+
+The coordinator and badge reader make **no network requests** and have no remote data destination. They do not read project files, transcript files, Claude's credential store, Keychain, API keys, or authentication tokens. Child processes inherit an OS environment normally; the coordinator does not look up or use credential variables. The only environment setting it explicitly reads is `CLAUDE_SLOT_HOME` (home-directory resolution also uses standard OS/Python behavior).
+
+The `turn.step` middleware receives a turn event and passes it to `next(e)` only after admission. It forwards stream chunks without inspecting or persisting prompts, answers, or tool results. This allows Claude's normal model request to proceed; it does not add a second request or send conversation content to the coordinator. `session.start` registers `/slots`; `command.run` handles only that local command; `turn.complete` releases a main-turn reservation. No additional model tools or agents are registered.
+
+### Optional statusline and development-only commands
+
+`statusline_setup.py` runs **only when explicitly installed by the user**, never at plugin startup. Installation/removal reads and rewrites Claude's `settings.json` while preserving unrelated settings, and saves only the previous `statusLine` value. Settings can contain sensitive values; this helper neither extracts credentials nor transmits settings. It uses `CLAUDE_CONFIG_DIR` for the settings location.
+
+When rendering, its wrapper executes the user's pre-existing statusline command through the OS shell, with the same statusline JSON on stdin and a three-second timeout. That command is user-controlled and can have its own filesystem/network behavior; Slot Guard cannot guarantee its privacy. The wrapper adds the local badge using only `session_id`. Users who do not want to execute a previous command can use `statusline.py` directly in their own statusline. There is no bundled network statusline command.
+
+Files under `tests/`, `scripts/`, and `.github/` are development/release tooling, not plugin startup hooks. Test subprocesses receive only an allowlist of runtime environment variables (`PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `SYSTEMROOT`) plus explicit test settings, never a copy of the entire environment. Tests set `ANTHROPIC_API_KEY` to the literal non-secret `local-test-not-a-key` and `ANTHROPIC_BASE_URL` to an unreachable loopback address. These are test fixtures, not credentials read from the installer. The CI workflow downloads and runs Anthropic's official installer solely on an ephemeral GitHub runner to install the pinned Claude test executable. The marketplace smoke test fetches the explicitly selected plugin source. Neither operation is invoked by the installed mod. The release ZIP excludes all test, build, and CI tooling.
+
+The directory's process/conversation/credential heuristics may require human review. This section documents the actual behavior; a successful local validator is not an assertion of directory-policy approval.
 
 ## Development
 

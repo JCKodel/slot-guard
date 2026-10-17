@@ -2,8 +2,8 @@
 const emptyStep = e => ({turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null});
 
 async function call($, data) {
-  const result = await $.process.run(['python3', $.plugin.root + '/guard.py', 'client'], {
-    stdin: JSON.stringify(data), timeoutMs: 25000,
+  const result = await $.process.run(['python3', 'guard.py', 'client'], {
+    cwd: $.plugin.root, stdin: JSON.stringify(data), timeoutMs: 25000,
   });
   if (result.exitCode !== 0) throw new Error('Coordinator unavailable: ' + result.stderr.trim());
   const response = JSON.parse(result.stdout);

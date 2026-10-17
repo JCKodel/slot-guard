@@ -61,7 +61,7 @@ def process_identity(pid):
         return Path('/proc/sys/kernel/random/boot_id').read_text().strip() + ':' + fields[19]
     p = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'lstart=', '-o', 'stat='],
                        capture_output=True, text=True, timeout=3,
-                       env={**os.environ, 'LC_ALL': 'C'})
+                       env={'LC_ALL': 'C'})
     if p.returncode == 1 and not p.stdout.strip() and not p.stderr.strip():
         return None
     if p.returncode != 0:

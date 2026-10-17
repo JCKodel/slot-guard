@@ -9,6 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from scripts.test_environment import test_environment
 from guard import initialize, local_call
 from statusline import badge
 from statusline_setup import setup
@@ -41,7 +42,7 @@ class PackagingTests(unittest.TestCase):
             setup(config,runtime)
             data = json.loads(settings.read_text())
             result = subprocess.run(data['statusLine']['command'],shell=True,input='{}',text=True,capture_output=True,
-                                    env={**os.environ,'CLAUDE_SLOT_HOME':str(state)})
+                                    env={**test_environment(),'CLAUDE_SLOT_HOME':str(state)})
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout, 'existing line 1\nexisting line 2\nSlots T □□ 0/2 I □□ 0/2\n')
             data['other'] = 'new'; settings.write_text(json.dumps(data))

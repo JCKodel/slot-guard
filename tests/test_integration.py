@@ -15,6 +15,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from scripts.test_environment import test_environment
 from guard import initialize, local_call, process_identity
 
 
@@ -51,7 +52,7 @@ class IntegrationTests(unittest.TestCase):
     def claude(self, delay=.1, home=None, children=False, stream=False):
         sid=str(uuid.uuid4())
         home=home or self.home
-        env={**os.environ,'CLAUDE_SLOT_HOME':str(home),'SLOT_TEST_DELAY':str(delay),
+        env={**test_environment(),'CLAUDE_SLOT_HOME':str(home),'SLOT_TEST_DELAY':str(delay),
              'SLOT_TEST_CHILDREN':'1' if children else '0',
              'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1',
              'ANTHROPIC_API_KEY':'local-test-not-a-key', 'ANTHROPIC_BASE_URL':'http://127.0.0.1:1'}

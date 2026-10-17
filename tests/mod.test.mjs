@@ -6,7 +6,10 @@ function harness(respond) {
   const handlers = {}, fallbacks = {}, calls = [], aborts = [];
   register((event, matcher, handler) => { handlers[event] = handler || matcher; return {catch(fn) {fallbacks[event]=fn;}}; });
   const $ = {plugin:{root:'/plugin'}, session:{id:async()=> 'session'},
-    process:{run:async(argv,opts)=>{const data=JSON.parse(opts.stdin);calls.push(data);
+    process:{run:async(argv,opts)=>{
+      assert.deepEqual(argv, ['python3','guard.py','client']);
+      assert.equal(opts.cwd, '/plugin');
+      const data=JSON.parse(opts.stdin);calls.push(data);
       return {exitCode:0,stdout:JSON.stringify(await respond(data)),stderr:''};}},
     ui:{status(){}}, turn:{abort:async e => {aborts.push(e.turnId);}}};
   return {handlers,fallbacks,$,calls,aborts};

@@ -10,7 +10,7 @@ version = json.loads((root/'.claude-plugin/plugin.json').read_text())['version']
 out = root/'dist'
 out.mkdir(exist_ok=True)
 archive = out/f'slot-guard-{version}.zip'
-files = ['.claude-plugin/plugin.json','.claude-plugin/marketplace.json','hooks/hooks.json',
+files = ['.claude-plugin/icon.png', '.claude-plugin/plugin.json','.claude-plugin/marketplace.json','hooks/hooks.json',
          'hooks/register.js','guard.py','statusline.py','statusline_setup.py','LICENSE',
          'README.md','CHANGELOG.md','SECURITY.md','CONTRIBUTING.md',
          'docs/architecture.md','docs/releasing.md']

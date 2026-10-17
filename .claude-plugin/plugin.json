@@ -1,6 +1,6 @@
 {
   "name": "slot-guard",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "description": "Machine-wide FIFO concurrency slots for Claude Code turns and inference. Local coordination, no daemon.",
   "author": {
     "name": "J.C.K\u00f6del",
@@ -14,5 +14,6 @@
     "fifo",
     "slots",
     "cost-control"
-  ]
+  ],
+  "icon": "./.claude-plugin/icon.png"
 }

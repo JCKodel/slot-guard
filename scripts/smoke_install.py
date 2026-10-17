@@ -6,11 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from test_environment import test_environment
 
 root = Path(__file__).resolve().parents[1]
 source = sys.argv[1] if len(sys.argv)>1 else str(root)
 with tempfile.TemporaryDirectory(prefix='slot-install-') as tmp:
-    env = {**os.environ, 'CLAUDE_CONFIG_DIR':tmp+'/config', 'CLAUDE_SLOT_HOME':tmp+'/state',
+    env = {**test_environment(), 'CLAUDE_CONFIG_DIR':tmp+'/config', 'CLAUDE_SLOT_HOME':tmp+'/state',
            'ANTHROPIC_API_KEY':'local-test-not-a-key', 'ANTHROPIC_BASE_URL':'http://127.0.0.1:1',
            'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1', 'DISABLE_AUTOUPDATER':'1',
            'SLOT_TEST_DELAY':'0', 'SLOT_TEST_CHILDREN':'0'}
@@ -20,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='slot-install-') as tmp:
         '--plugin-dir',str(root/'tests/fixtures/fake-model'), '--setting-sources','user',
         '--strict-mcp-config','--tools','','--disable-slash-commands','--no-session-persistence',
         '--prompt-suggestions','false','--system-prompt','Test.','--model','haiku',
-        '--effort','low','--output-format','json'], env=env, capture_output=True,text=True,timeout=30)
+        '--effort','low','--output-format','json'], cwd=tmp, env=env, capture_output=True,text=True,timeout=30)
     if result.returncode:
         raise RuntimeError(result.stderr + result.stdout)
     response=json.loads(result.stdout)
