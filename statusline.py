@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Read-only global occupancy and session queue; never changes reservations."""
+from contextlib import closing
 import os
 import json
 from pathlib import Path
@@ -20,7 +21,7 @@ def badge(home, session):
         return 'Slots —'
     try:
         limits = json.loads((home / 'config.json').read_text())
-        with sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True, timeout=.1) as conn:
+        with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True, timeout=.1)) as conn:
             used = dict(conn.execute("SELECT pool,count(*) FROM tickets WHERE state='granted' GROUP BY pool"))
             rows = conn.execute("""SELECT t.pool,
                 (SELECT count(*) FROM tickets q
