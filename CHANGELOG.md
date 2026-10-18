@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2-beta.1
+
+- Subagents no longer fail with "Agent stalled: no progress for 600s" while waiting for a slot: a parent waiting for its subagent hands it its slot; subagents and resumed turns queue before new prompts; a subagent waiting 7 minutes is admitted over the limit (never during a pause), logged and shown in `/slots`.
+- Pace follows the recent burn rate (last hour for the 5-hour window) instead of the window's average, so the limit rises again once usage slows: an early burst no longer pins it at 1 for the rest of the window.
+- Correction to 0.5.1: in interactive sessions Claude Code reports a subagent abandoned after 10 minutes as failed ("Agent stalled"); the "dispatch it again" text is not what the parent sees.
+
 ## 0.5.1-beta.1
 
 - `configure --max N`: with plenty left in every window (pace above 1.25, weekly included), the limit may rise above the normal `--agents` value up to N, one slot per 10 minutes, and returns toward normal once any window falls under 1.1. Off by default.

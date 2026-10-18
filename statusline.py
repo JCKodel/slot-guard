@@ -29,9 +29,13 @@ def badge(home, session):
                 control = dict(conn.execute('SELECT name,value FROM control'))
             except sqlite3.OperationalError:
                 control = {}  # Created by the first coordinator call of 0.5.0.
-            rows = conn.execute("""SELECT t.pool,
+            # Queue order is rank, then sequence; a database not yet migrated has no rank.
+            columns = {r[1] for r in conn.execute('PRAGMA table_info(tickets)')}
+            ahead = ('(q.rank<t.rank OR (q.rank=t.rank AND q.seq<=t.seq))' if 'rank' in columns
+                     else 'q.seq<=t.seq')
+            rows = conn.execute(f"""SELECT t.pool,
                 (SELECT count(*) FROM tickets q
-                 WHERE q.pool=t.pool AND q.state='queued' AND q.seq<=t.seq)
+                 WHERE q.pool=t.pool AND q.state='queued' AND {ahead})
                 FROM tickets t WHERE t.session=? AND t.state='queued'
                 ORDER BY t.seq""", (session,)).fetchall()
         # One badge per pool, at the earliest position held by this session.

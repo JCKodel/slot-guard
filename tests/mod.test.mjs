@@ -22,6 +22,9 @@ async function drain(g) {for(;;){const n=await g.next();if(n.done)return n.value
 async function step(h,e=event) {return drain(h.handlers['turn.step'](h.$,e,next(async function*(){return {};})));}
 async function complete(h,e=event) {return h.handlers['turn.complete'](h.$,e,next());}
 const tick=()=>new Promise(resolve=>setTimeout(resolve,0));
+const released=(h,key)=>h.calls.filter(c=>c.op==='release'&&c.key===key).length;
+async function start(h) {await h.handlers['session.start'](h.$,{},async()=>({}));}
+async function beat(h) {for(const fn of h.timers) await fn(); await tick(); await tick();}
 
 test('agent retains one slot across model steps and tools until turn ends',async()=>{
   const h=harness();await step(h);
@@ -38,27 +41,6 @@ test('main and subagent acquire the same pool and release independently',async()
   await complete(h,{...event,agentId:'child',turnId:'child-turn'});
   assert.equal(h.calls.filter(c=>c.op==='release').length,1);
   await complete(h);assert.equal(h.calls.filter(c=>c.op==='release').length,2);
-});
-test('foreground child wait yields parent slot; parent reacquires with a new FIFO ticket',async()=>{
-  const h=harness();await step(h);
-  await h.handlers['tool.call'](h.$,{tool:'Agent'},next(async()=>{
-    assert.equal(h.calls.at(-1).op,'release');
-    await step(h,{...event,agentId:'child',turnId:'child-turn'});
-    await complete(h,{...event,agentId:'child',turnId:'child-turn'});return {};
-  }));
-  const count=h.calls.length;
-  await step(h,{...event,index:1});
-  assert.equal(h.calls[count].op,'acquire');assert.notEqual(h.calls[0].key,h.calls[count].key);
-});
-test('parallel ordinary tool keeps parent counted while another tool waits for a child',async()=>{
-  const h=harness();await step(h);
-  let finishRead,finishAgent;
-  const read=h.handlers['tool.call'](h.$,{tool:'Read'},next(()=>new Promise(r=>{finishRead=r;})));
-  await tick();
-  const child=h.handlers['tool.call'](h.$,{tool:'Agent'},next(()=>new Promise(r=>{finishAgent=r;})));
-  await tick();assert.equal(h.calls.filter(c=>c.op==='release').length,0);
-  finishRead({});await read;assert.equal(h.calls.at(-1).op,'release');
-  finishAgent({});await child;
 });
 test('TaskOutput waiting yields but nonblocking polling retains slot',async()=>{
   const h=harness();await step(h);
@@ -92,22 +74,6 @@ test('tools outside an admitted turn are denied',async()=>{
   assert.ok(result.deny);assert.equal(invoked,false);
 });
 
-test('nested delegation yields each ancestor and reacquires before continuing',async()=>{
-  const h=harness();await step(h);
-  const child={turnId:'child-turn',agentId:'child',index:0};
-  const grandchild={turnId:'grandchild-turn',agentId:'grandchild',index:0};
-  await h.handlers['tool.call'](h.$,{tool:'Agent'},next(async()=>{
-    await step(h,child);
-    await h.handlers['tool.call'](h.$,{tool:'Agent',agentId:'child'},next(async()=>{
-      await step(h,grandchild);await complete(h,grandchild);return {};
-    }));
-    await step(h,{...child,index:1});await complete(h,child);return {};
-  }));
-  await step(h,{...event,index:1});await complete(h);
-  let active=new Set(),peak=0;
-  for(const c of h.calls){if(c.op==='acquire')active.add(c.key);else if(c.op==='release')active.delete(c.key);peak=Math.max(peak,active.size);}
-  assert.equal(peak,1);assert.equal(active.size,0);
-});
 test('turn completion cannot free a slot while an ordinary tool is still running',async()=>{
   const h=harness();await step(h);let finish;
   const tool=h.handlers['tool.call'](h.$,{tool:'Bash'},next(()=>new Promise(r=>{finish=r;})));
@@ -115,18 +81,6 @@ test('turn completion cannot free a slot while an ordinary tool is still running
   assert.equal(h.calls.filter(c=>c.op==='release').length,0);
   finish({});await tool;assert.equal(h.calls.at(-1).op,'release');
 });
-test('ordinary work resuming while a child is pending obtains a slot first',async()=>{
-  const h=harness();await step(h);let finish;
-  const child=h.handlers['tool.call'](h.$,{tool:'Agent'},next(()=>new Promise(r=>{finish=r;})));
-  await tick();assert.equal(h.calls.at(-1).op,'release');
-  await h.handlers['tool.call'](h.$,{tool:'Read'},next(async()=>{assert.equal(h.calls.at(-1).op,'acquire');return {};}));
-  assert.equal(h.calls.at(-1).op,'release');finish({});await child;
-});
-
-const released=(h,key)=>h.calls.filter(c=>c.op==='release'&&c.key===key).length;
-async function start(h) {await h.handlers['session.start'](h.$,{},async()=>({}));}
-async function beat(h) {for(const fn of h.timers) await fn(); await tick(); await tick();}
-
 test('failed release is retried at turn end, then by the heartbeat',async()=>{
   let failures=2;const h=harness();
   h.$.process.run=(orig=>async(argv,opts)=>{const d=JSON.parse(opts.stdin);
@@ -295,4 +249,97 @@ test('a paused subagent abandoned by the engine tells its parent to retry',async
   const n=async function*(){throw new Error('must not run');};n.signal=controller.signal;
   const out=await drain(h.handlers['turn.step'](h.$,{turnId:'c',agentId:'child',index:0},n));
   assert.match(out.answer,/Dispatch it again after/);assert.equal(h.aborts.length,0);
+});
+
+async function spawn(h,parent,child) {
+  return h.handlers['agent.spawn'](h.$,{parentAgentId:parent},async()=>({agentId:child,model:'m'}));
+}
+const acquires=h=>h.calls.filter(c=>c.op==='acquire');
+test('a parent waiting for its subagent hands it its slot',async()=>{
+  const h=harness();await step(h);const parentKey=h.calls[0].key;
+  await h.handlers['tool.call'](h.$,{tool:'Agent'},next(async()=>{
+    assert.equal(h.calls.filter(c=>c.op==='release').length,0);
+    await spawn(h,undefined,'child');
+    await step(h,{turnId:'child-turn',agentId:'child',index:0});
+    assert.equal(acquires(h).at(-1).key,parentKey);
+    await complete(h,{turnId:'child-turn',agentId:'child'});
+    assert.equal(released(h,parentKey),1);
+    return {};
+  }));
+  await step(h,{...event,index:1});
+  const resumed=acquires(h).at(-1);
+  assert.notEqual(resumed.key,parentKey);assert.equal(resumed.rank,0);
+});
+test('a parent reclaims its slot when no subagent took it',async()=>{
+  const h=harness();await step(h);const parentKey=h.calls[0].key;
+  await h.handlers['tool.call'](h.$,{tool:'Agent'},next(async()=>({})));
+  await step(h,{...event,index:1});
+  assert.equal(acquires(h).at(-1).key,parentKey);
+  assert.equal(h.calls.filter(c=>c.op==='release').length,0);
+});
+test('an unclaimed parked slot returns to the pool after a minute',async(t)=>{
+  const h=harness();await start(h);await step(h);const parentKey=h.calls.find(c=>c.op==='acquire').key;
+  let finish;const tool=h.handlers['tool.call'](h.$,{tool:'Agent'},next(()=>new Promise(r=>{finish=r;})));
+  await tick();await beat(h);assert.equal(released(h,parentKey),0);
+  assert.ok(h.calls.find(c=>c.op==='touch').keys.includes(parentKey));
+  const now=Date.now();t.mock.method(Date,'now',()=>now+61000);
+  await beat(h);assert.equal(released(h,parentKey),1);
+  finish({});await tool;
+});
+test('parallel ordinary tool keeps the parent counted; then its slot goes to the child',async()=>{
+  const h=harness();await step(h);const parentKey=h.calls[0].key;
+  let finishRead,finishAgent;
+  const read=h.handlers['tool.call'](h.$,{tool:'Read'},next(()=>new Promise(r=>{finishRead=r;})));
+  await tick();
+  const child=h.handlers['tool.call'](h.$,{tool:'Agent'},next(()=>new Promise(r=>{finishAgent=r;})));
+  await tick();
+  finishRead({});await read;
+  await spawn(h,undefined,'kid');await step(h,{turnId:'k',agentId:'kid',index:0});
+  assert.equal(acquires(h).at(-1).key,parentKey);
+  assert.equal(h.calls.filter(c=>c.op==='release').length,0);
+  finishAgent({});await child;
+});
+test('nested delegation passes one slot down and back: never more than one held',async()=>{
+  const h=harness();await step(h);
+  const child={turnId:'child-turn',agentId:'child',index:0};
+  const grandchild={turnId:'grandchild-turn',agentId:'grandchild',index:0};
+  await h.handlers['tool.call'](h.$,{tool:'Agent'},next(async()=>{
+    await spawn(h,undefined,'child');await step(h,child);
+    await h.handlers['tool.call'](h.$,{tool:'Agent',agentId:'child'},next(async()=>{
+      await spawn(h,'child','grandchild');await step(h,grandchild);await complete(h,grandchild);return {};
+    }));
+    await step(h,{...child,index:1});await complete(h,child);return {};
+  }));
+  await step(h,{...event,index:1});await complete(h);
+  let active=new Set(),peak=0;
+  for(const c of h.calls){if(c.op==='acquire')active.add(c.key);else if(c.op==='release')active.delete(c.key);peak=Math.max(peak,active.size);}
+  assert.equal(peak,1);assert.equal(active.size,0);
+});
+test('ordinary work resuming while a child is pending takes the parked slot back',async()=>{
+  const h=harness();await step(h);const parentKey=h.calls[0].key;let finish;
+  const child=h.handlers['tool.call'](h.$,{tool:'Agent'},next(()=>new Promise(r=>{finish=r;})));
+  await tick();
+  await h.handlers['tool.call'](h.$,{tool:'Read'},next(async()=>{assert.equal(acquires(h).at(-1).key,parentKey);return {};}));
+  assert.equal(h.calls.filter(c=>c.op==='release').length,0);
+  finish({});await child;
+});
+test('new prompts queue behind work under way',async()=>{
+  const h=harness();await step(h);await step(h,{turnId:'c',agentId:'c',index:0});
+  assert.deepEqual(acquires(h).map(c=>c.rank),[1,0]);
+});
+test('a subagent step waiting close to the stall limit is admitted by force',async(t)=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const h=harness(async d=>{if(d.op!=='acquire') return {};now+=200000;return {state:d.force?'granted':'queued'};});
+  await step(h,{turnId:'c',agentId:'c',index:0});
+  const sent=acquires(h);assert.ok(sent.at(-1).force);assert.ok(!sent[0].force);
+  assert.ok(sent.slice(1,-1).every(c=>c.wait<=15));
+  const m=harness(async d=>{now+=200000;return {state:d.op==='acquire'&&acquires(m).length>4?'granted':'queued'};});
+  await step(m);assert.ok(!acquires(m).some(c=>c.force));
+});
+test('slots shows the recent rate and any overdraft',async()=>{
+  const h=harness(async()=>({limits:{agent:1},auto:{enabled:true,cap:3,max:3,target:95,
+    windows:[{kind:'five_hour',percent:26,elapsed:27,rate:3.9,pace:4.8}]},
+    tickets:[{seq:1,state:'granted',session:'s',pid:2,idle:0},{seq:2,state:'granted',session:'s',pid:2,idle:0}]}));
+  const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
+  assert.match(r.text,/3.9%\/h lately, pace 4.80/);assert.match(r.text,/1 over the limit/);
 });

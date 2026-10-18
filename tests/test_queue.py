@@ -11,7 +11,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import AUTO_STEP, Queue, auto_limit, initialize, local_call, pace, process_identity
+from guard import AUTO_STEP, Queue, auto_limit, initialize, local_call, pace, process_identity, recent_rate
 
 
 class QueueTests(unittest.TestCase):
@@ -212,14 +212,27 @@ class QueueTests(unittest.TestCase):
 
 class AutoLimitTests(unittest.TestCase):
     H = 3600
-    def test_pace_takes_the_worse_of_average_and_remaining(self):
-        # 14% used after 30 min of a 5 h window: the average burn decides.
-        self.assertAlmostEqual(pace(14, 4.5*self.H, 5*self.H, 0), 0.1*95/14, places=6)
-        # 82% used with 78% gone: the remaining budget decides.
+    def test_pace_follows_the_recent_rate(self):
+        H = self.H
+        # A fast start: 14% in the first 30 minutes, 28%/h against a sustainable ~18%/h.
+        self.assertLess(pace(14, 4.5*H, 5*H, 0, rate=14/(0.5*H)), 0.9)
+        # This morning's case: 26% used, but only ~4%/h lately with 3.65 h left.
+        self.assertGreater(pace(26, 3.65*H, 5*H, 0, rate=4/H), 1.25)
+        self.assertEqual(pace(30, 2*H, 5*H, 0, rate=0), float('inf'))
+        self.assertEqual(pace(99, 2*H, 5*H, 0, rate=1/H), 0)
+
+    def test_without_a_rate_pace_compares_budget_and_time_left(self):
         self.assertAlmostEqual(pace(82, 1.1*self.H, 5*self.H, 0), (13/95)/0.22, places=6)
         self.assertGreater(pace(30, 2*self.H, 5*self.H, 0), 1)
-        self.assertEqual(pace(99, 2*self.H, 5*self.H, 0), 0)
-        self.assertGreater(pace(0, 4*self.H, 5*self.H, 0), 1)
+
+    def test_recent_rate_needs_a_long_enough_span(self):
+        H = self.H
+        self.assertIsNone(recent_rate([(10, 0)], 100, 'five_hour'))
+        self.assertIsNone(recent_rate([(10, 0), (11, 300)], 400, 'five_hour'))
+        self.assertAlmostEqual(recent_rate([(10, 0), (12, 1200)], 1800, 'five_hour'), 2/1800)
+        # Readings older than the span are left out; a quiet hour means no burn.
+        self.assertIsNone(recent_rate([(5, 0), (10, 600)], 2*H, 'five_hour'))
+        self.assertEqual(recent_rate([(10, 0), (10, 900)], 1000, 'five_hour'), 0)
 
     def test_pace_ignores_expired_and_first_minutes(self):
         self.assertIsNone(pace(10, -1, 5*self.H, 0))
@@ -368,6 +381,39 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(json.loads((home/'config.json').read_text())['max'], 5)
         self.assertEqual(initialize(home, 4, replace=True)['auto']['max'], 5)
         self.assertNotIn('max', json.loads(initialize(home, 6, replace=True) and (home/'config.json').read_text()))
+
+    def ticket(self, key, **extra):
+        return {'op':'acquire','key':key,'pool':'agent','session':'s','turn':key,'pid':10,'birth':'b', **extra}
+
+    def test_work_under_way_goes_before_new_prompts(self):
+        for k in 'abc': self.q.operate(self.ticket(k))
+        self.assertEqual(self.q.operate(self.ticket('new'))['position'], 1)
+        child = self.q.operate(self.ticket('child', rank=0))
+        self.assertEqual((child['state'], child['position']), ('queued', 1))
+        self.q.operate({'op':'release','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'})
+        self.assertEqual(self.q.operate(self.ticket('child', rank=0))['state'], 'granted')
+        self.assertEqual(self.q.operate(self.ticket('new'))['state'], 'queued')
+
+    def test_forced_admission_overdraws_but_never_during_a_pause(self):
+        for k in 'abc': self.q.operate(self.ticket(k))
+        self.assertEqual(self.q.operate(self.ticket('late', rank=0, force=True))['state'], 'granted')
+        self.q.operate({'op':'release','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'})
+        self.assertEqual(self.q.operate(self.ticket('next'))['state'], 'queued')  # Still 3 working.
+        self.assertIn('overdraft', (Path(self.temp.name)/'auto.log').read_text())
+        self.usage(96, 1)
+        self.assertEqual(self.q.operate(self.ticket('paused', rank=0, force=True))['state'], 'queued')
+
+    def test_limit_recovers_when_recent_usage_slows(self):
+        for k in 'abc': self.acquire(k)
+        # Window 30 min in: a burst to 14%.
+        self.usage(1, 4.75); self.now += 25*60; self.usage(14, 4.5 - 25/60 + 0.25)
+        self.assertLess(self.q.operate({'op':'status'})['limits']['agent'], 3)
+        # Hours later, slow: 26% with 3.65 h left, only 2 points in the last hour.
+        resets = self.q.windows()[0]['resets']
+        for minutes in range(0, 70, 10):
+            self.now += 600
+            self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':24 + (minutes >= 60) * 2,'resets':resets}]})
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
 
     def test_auto_off_ignores_usage(self):
         q = Queue(Path(self.temp.name)/'q2.db', 3, {10:'b'}.get, auto=False, clock=lambda: self.now)

@@ -37,19 +37,39 @@ AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
                'seven_day': {'low': 0.5, 'high': 0.5, 'floor': 2}}
 
 
-def pace(percent, resets, length, now, target=AUTO_TARGET):
+# Recent burn rate: readings over this span, at least MIN apart (percent moves in whole points).
+RATE_SPAN = {'five_hour': 3600, 'seven_day': 12 * 3600}
+RATE_MIN = {'five_hour': 600, 'seven_day': 2 * 3600}
+
+
+def recent_rate(history, now, kind):
+    """Percent per second over the recent span, or None without enough readings.
+
+    history: (percent, at) pairs of one window, oldest first.
+    """
+    recent = [(p, t) for p, t in history if now - t <= RATE_SPAN[kind]]
+    if len(recent) < 2 or recent[-1][1] - recent[0][1] < RATE_MIN[kind]:
+        return None
+    (p0, t0), (p1, _) = recent[0], recent[-1]
+    return max(0.0, p1 - p0) / (now - t0)
+
+
+def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None):
     """How sustainable usage is: 1 on pace to end at target, below 1 too fast.
 
-    The worse of two views: average burn so far (catches a fast start) and the
-    budget left over the time left (catches a late squeeze). None when the
-    reading cannot be judged: expired, malformed, or too early in the window.
+    With a recent burn rate: the budget left over what that rate spends in the
+    time left. It follows the current load, so the limit recovers once usage
+    slows. Without one, the share of budget left over the share of time left.
+    None when the reading cannot be judged: expired, malformed, or too early.
     """
-    left = (resets - now) / length
+    seconds_left = resets - now
+    left = seconds_left / length
     if not 0 < left <= 1 - AUTO_WARMUP / length:
         return None
-    remaining = max(0.0, target - percent) / target / left
-    average = (1 - left) * target / percent if percent > 0 else float('inf')
-    return min(remaining, average)
+    budget = max(0.0, target - percent)
+    if rate is not None:
+        return budget / (rate * seconds_left) if rate > 0 else float('inf')
+    return budget / target / left
 
 
 def auto_limit(current, cap, signals, now, changed, ceiling=None):
@@ -202,6 +222,11 @@ class Queue:
         self.db.execute('''CREATE TABLE IF NOT EXISTS usage (kind TEXT PRIMARY KEY,
             percent REAL NOT NULL, resets REAL NOT NULL, seen REAL NOT NULL)''')
         self.db.execute('CREATE TABLE IF NOT EXISTS control (name TEXT PRIMARY KEY, value REAL NOT NULL)')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS usage_log (kind TEXT NOT NULL, resets REAL NOT NULL,
+            percent REAL NOT NULL, at REAL NOT NULL)''')
+        if 'rank' not in columns:
+            # 0: work already under way (subagents, resumptions) goes before new prompts (1).
+            self.db.execute('ALTER TABLE tickets ADD COLUMN rank INTEGER NOT NULL DEFAULT 1')
         self.db.commit()
 
     def reap(self):
@@ -227,10 +252,25 @@ class Queue:
 
     def windows(self):
         now = self.clock()
-        return [{'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
-                 'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
-                 'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now)}
-                for r in self.db.execute('SELECT * FROM usage') if r['kind'] in WINDOWS]
+        result = []
+        for r in self.db.execute('SELECT * FROM usage').fetchall():
+            if r['kind'] not in WINDOWS:
+                continue
+            history = self.db.execute('SELECT percent,at FROM usage_log WHERE kind=? AND abs(resets-?)<=60 ORDER BY at',
+                                      (r['kind'], r['resets'])).fetchall()
+            rate = recent_rate([tuple(h) for h in history], now, r['kind'])
+            result.append({'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
+                           'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
+                           'rate': None if rate is None else round(rate * 3600, 2),  # Percent per hour.
+                           'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=rate)})
+        return result
+
+    def note(self, entry):
+        try:
+            with self.log.open('a') as f:
+                f.write(json.dumps(entry) + '\n')
+        except OSError:
+            pass  # The log is a convenience; admission must not depend on it.
 
     def _control(self):
         """Set the effective limit; with auto off it is the configured one."""
@@ -251,12 +291,8 @@ class Queue:
                     previous = self.cap  # A renewed window starts again from the maximum.
                 limit, changed = auto_limit(previous, self.cap, signals, now, value.get('changed', 0), self.ceiling)
             if limit != previous:
-                try:
-                    with self.log.open('a') as f:
-                        f.write(json.dumps({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
-                                            'paces': {k: round(p, 2) for k, p in signals}}) + '\n')
-                except OSError:
-                    pass  # The log is a convenience; admission must not depend on it.
+                self.note({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
+                           'paces': {k: round(p, 2) for k, p in signals}})
             self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
         self.db.execute("INSERT OR REPLACE INTO control VALUES ('effective',?),('until',?)", (limit, until))
         self.limits['agent'] = limit
@@ -271,7 +307,7 @@ class Queue:
             used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (pool,)).fetchone()[0]
             free = max(0, limit - used)
             self.db.execute("""UPDATE tickets SET state='granted' WHERE seq IN
-                (SELECT seq FROM tickets WHERE pool=? AND state='queued' ORDER BY seq LIMIT ?)""", (pool, free))
+                (SELECT seq FROM tickets WHERE pool=? AND state='queued' ORDER BY rank, seq LIMIT ?)""", (pool, free))
 
     @staticmethod
     def validate_owner(data):
@@ -307,7 +343,7 @@ class Queue:
                     'tickets': [
                 {**dict(r), 'idle': round(now - r['seen'])} for r in self.db.execute(
                     f"""SELECT seq,pool,session,turn,pid,state,coalesce(touched,created) AS seen
-                    FROM tickets WHERE {LIVE} ORDER BY seq""")]}
+                    FROM tickets WHERE {LIVE} ORDER BY rank, seq""")]}
         if op == 'evict':
             seqs = data.get('seqs')
             if not isinstance(seqs, list) or not 0 < len(seqs) <= 64 or any(type(n) is not int for n in seqs):
@@ -337,6 +373,12 @@ class Queue:
                         percent = r['percent']
                     self.db.execute('INSERT OR REPLACE INTO usage VALUES (?,?,?,?)',
                                     (r['kind'], percent, r['resets'], time.time()))
+                    last = self.db.execute('SELECT percent FROM usage_log WHERE kind=? ORDER BY at DESC LIMIT 1',
+                                           (r['kind'],)).fetchone()
+                    if last is None or last[0] != percent:
+                        self.db.execute('INSERT INTO usage_log VALUES (?,?,?,?)',
+                                        (r['kind'], r['resets'], percent, self.clock()))
+                self.db.execute('DELETE FROM usage_log WHERE at<?', (self.clock() - 2 * 86400,))
                 self._promote()
             return {'limit': self.limits['agent']}
         if op == 'touch':
@@ -374,22 +416,30 @@ class Queue:
             row = self.db.execute('SELECT * FROM tickets WHERE key=?', (data['key'],)).fetchone()
             if row and tuple(row[k] for k in ('key','pool','session','turn','pid','birth')) != values:
                 raise ValueError('Ticket belongs to a different operation')
-            insert = 'INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created,touched,instance) VALUES(?,?,?,?,?,?,?,?,?,?)'
+            insert = 'INSERT OR IGNORE INTO tickets(key,pool,session,turn,pid,birth,state,created,touched,instance,rank) VALUES(?,?,?,?,?,?,?,?,?,?,?)'
+            rank = 0 if data.get('rank') == 0 else 1
             if op == 'acquire':
                 if self.identity(data['pid']) != data['birth']:
                     raise ValueError('Owner is not alive')
-                self.db.execute(insert, (*values, 'queued', now, now, data.get('instance', '')))
+                self.db.execute(insert, (*values, 'queued', now, now, data.get('instance', ''), rank))
                 self.db.execute(f'UPDATE tickets SET touched=? WHERE key=? AND {LIVE}', (now, data['key']))
+                if data.get('force') is True:
+                    self._control()
+                    if self.limits['agent'] > 0 and self.db.execute(
+                            "UPDATE tickets SET state='granted' WHERE key=? AND state='queued'", (data['key'],)).rowcount:
+                        # Claude Code abandons a subagent's step after 600 s without progress:
+                        # admit it over the limit rather than fail it. Nothing new starts until it drains.
+                        self.note({'at': now, 'overdraft': data['key'], 'limit': self.limits['agent']})
             else:
                 # Tombstone prevents a delayed acquire from resurrecting canceled work.
-                self.db.execute(insert, (*values, 'released', now, now, data.get('instance', '')))
+                self.db.execute(insert, (*values, 'released', now, now, data.get('instance', ''), rank))
                 self.db.execute("UPDATE tickets SET state='released', touched=? WHERE key=?", (now, data['key']))
             self._promote()
         if op != 'acquire':
             return {'state': 'released'}
         row = self.db.execute('SELECT seq,state FROM tickets WHERE key=?', (data['key'],)).fetchone()
-        position = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='queued' AND seq<=?",
-                                   (data['pool'], row['seq'])).fetchone()[0]
+        position = self.db.execute("""SELECT count(*) FROM tickets WHERE pool=? AND state='queued'
+            AND (rank<? OR (rank=? AND seq<=?))""", (data['pool'], rank, rank, row['seq'])).fetchone()[0]
         result = {'state': row['state'], 'ticket': row['seq'], 'position': position}
         if self.limits['agent'] == 0:
             result['paused_until'] = self.until

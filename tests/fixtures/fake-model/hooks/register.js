@@ -32,8 +32,11 @@ export function register(on) {
       return {turnId:e.turnId,index:e.index,answer:'',toolUses:[{name:'Agent',input},{name:'Agent',input},{name:'Agent',input}],stopReason:'tool_use',usage:null};
     }
     await $.fs.write(home + '/' + name + '.started', String(Date.now()));
-    await $.process.run(['python3', '-c', 'import time; time.sleep(float(__import__("sys").argv[1]))', delay || '0.1']);
+    // Like a real model: the first chunk comes at once, then the answer takes its time.
     yield {kind:'text',index:0,text:'LOCAL_TEST_OK'};
+    // $.process.run stops a child after 30 s by default; long test delays need more.
+    await $.process.run(['python3', '-c', 'import time; time.sleep(float(__import__("sys").argv[1]))', delay || '0.1'],
+      {timeoutMs: Math.min(600000, (Number(delay || 0.1) + 30) * 1000)});
     yield {kind:'stop',stopReason:'end_turn',usage:null};
     await $.fs.write(home + '/' + name + '.finished', String(Date.now()));
     return {turnId:e.turnId,index:e.index,answer:'LOCAL_TEST_OK',toolUses:[],stopReason:'end_turn',usage:null};

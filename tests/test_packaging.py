@@ -26,6 +26,20 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(badge(home,'s1'), 'Agents ■ 1/1 · 2 waiting · ⌛ #2')
             self.assertEqual(badge(home,'s3'), 'Agents ■ 1/1 · 2 waiting')
 
+    def test_badge_reads_a_database_not_yet_migrated(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home/'config.json').write_text(json.dumps({'agents': 2, 'schema': 2}))
+            db = sqlite3.connect(home/'queue.sqlite3')
+            db.execute("""CREATE TABLE tickets (seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL,
+                pool TEXT NOT NULL, session TEXT NOT NULL, turn TEXT NOT NULL, pid INTEGER NOT NULL,
+                birth TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL)""")
+            for key, state in (('a', 'granted'), ('b', 'queued')):
+                db.execute("INSERT INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES(?,'agent','s','t',1,'b',?,0)", (key, state))
+            db.commit(); db.close()
+            self.assertEqual(badge(home, 's'), 'Agents ■□ 1/2 · 1 waiting · ⌛ #1')
+
     def test_badge_shows_automatic_limit_below_maximum(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)/'state'
