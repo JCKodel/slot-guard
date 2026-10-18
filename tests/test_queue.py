@@ -254,17 +254,21 @@ class AutoLimitTests(unittest.TestCase):
         self.assertEqual(auto_limit(2, 3, [('five_hour', 1.5)], T, 0), (3, T))
         self.assertEqual(auto_limit(5, 3, [('five_hour', 1.0)], T, 0), (3, 0))
 
-    def test_weekly_window_is_tolerant_and_keeps_two_agents(self):
+    def test_weekly_window_follows_its_linear_quota(self):
+        D = 86400
+        # Sunday 15:42: 12.9% of the week gone, 30% used: well above the line.
+        self.assertLess(pace(30, (1-0.129)*7*D, 7*D, 0, rate=0.1/3600, linear=True), 0.5)
+        # On the line (plus a point of slack): no objection.
+        self.assertGreaterEqual(pace(28, 5*D, 7*D, 0, rate=0.1/3600, linear=True), 1.0)
+        # The five-hour window is not held to a line.
+        self.assertGreater(pace(30, 4*3600, 5*3600, 0, rate=1/3600), 1.1)
+
+    def test_weekly_window_lowers_to_one_and_holds_a_rise(self):
         T = 10**6
-        self.assertEqual(auto_limit(3, 3, [('seven_day', 0.6)], T, 0), (3, 0))
-        self.assertEqual(auto_limit(3, 3, [('seven_day', 0.4)], T, 0), (2, T))
-        self.assertEqual(auto_limit(2, 3, [('seven_day', 0.1)], T, 0), (2, 0))
-        # Within its tolerance the weekly window does not hold back a rise.
-        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.5), ('seven_day', 0.6)], T, 0), (3, T))
-        # Below it, nothing rises; the five-hour window can still go under two.
-        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.5), ('seven_day', 0.4)], T, 0), (2, 0))
-        self.assertEqual(auto_limit(2, 3, [('five_hour', 0.5), ('seven_day', 0.4)], T, 0), (1, T))
-        self.assertEqual(auto_limit(1, 1, [('seven_day', 0.1)], T, 0), (1, 0))
+        self.assertEqual(auto_limit(2, 3, [('seven_day', 0.43)], T, 0), (1, T))
+        self.assertEqual(auto_limit(1, 3, [('seven_day', 0.43)], T, 0), (1, 0))
+        self.assertEqual(auto_limit(1, 3, [('five_hour', 1.5), ('seven_day', 1.0)], T, 0), (1, 0))
+        self.assertEqual(auto_limit(1, 3, [('five_hour', 1.5), ('seven_day', 1.2)], T, 0), (2, T))
 
     def test_above_normal_only_with_room_in_every_window(self):
         T = 10**6

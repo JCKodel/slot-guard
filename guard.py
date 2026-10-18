@@ -34,7 +34,11 @@ AUTO_WARMUP = 900   # Seconds: a window's first minutes are too noisy to act on.
 # lets the limit rise. The weekly window only acts at twice the pace and keeps two agents.
 AUTO_BOOST = (1.1, 1.25)  # Above the normal limit: rise only past 1.25 everywhere, return under 1.1.
 AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
-               'seven_day': {'low': 0.5, 'high': 0.5, 'floor': 2}}
+               'seven_day': {'low': 0.9, 'high': 1.1, 'floor': 1}}
+# Windows also held to a linear quota: used share no higher than elapsed share (1/7 a day
+# for the weekly one), so a fast start cannot borrow from the rest of the week.
+LINEAR = {'seven_day'}
+LINEAR_SLACK = 1.0  # Percent: readings come in whole points.
 
 
 # Recent burn rate: readings over this span, at least MIN apart (percent moves in whole points).
@@ -54,12 +58,14 @@ def recent_rate(history, now, kind):
     return max(0.0, p1 - p0) / (now - t0)
 
 
-def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None):
+def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, linear=False):
     """How sustainable usage is: 1 on pace to end at target, below 1 too fast.
 
     With a recent burn rate: the budget left over what that rate spends in the
     time left. It follows the current load, so the limit recovers once usage
     slows. Without one, the share of budget left over the share of time left.
+    With `linear`, also the elapsed share over the used share: below 1 while
+    usage is above the straight line from 0 to 100% across the window.
     None when the reading cannot be judged: expired, malformed, or too early.
     """
     seconds_left = resets - now
@@ -68,8 +74,12 @@ def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None):
         return None
     budget = max(0.0, target - percent)
     if rate is not None:
-        return budget / (rate * seconds_left) if rate > 0 else float('inf')
-    return budget / target / left
+        result = budget / (rate * seconds_left) if rate > 0 else float('inf')
+    else:
+        result = budget / target / left
+    if linear and percent > 0:
+        result = min(result, (100 * (1 - left) + LINEAR_SLACK) / percent)
+    return result
 
 
 def auto_limit(current, cap, signals, now, changed, ceiling=None):
@@ -262,7 +272,8 @@ class Queue:
             result.append({'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
                            'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
                            'rate': None if rate is None else round(rate * 3600, 2),  # Percent per hour.
-                           'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=rate)})
+                           'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=rate,
+                                        linear=r['kind'] in LINEAR)})
         return result
 
     def note(self, entry):

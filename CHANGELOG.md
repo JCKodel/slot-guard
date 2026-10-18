@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3-beta.1
+
+- The weekly window follows a linear quota (about 14.3% a day): while usage is above the line the limit drops, down to 1 agent, and does not rise until it is back under. It never pauses for the line. Replaces 0.5.1's tolerant weekly policy, which let a fast start borrow from the rest of the week.
+
 ## 0.5.2-beta.1
 
 - Subagents no longer fail with "Agent stalled: no progress for 600s" while waiting for a slot: a parent waiting for its subagent hands it its slot; subagents and resumed turns queue before new prompts; a subagent waiting 7 minutes is admitted over the limit (never during a pause), logged and shown in `/slots`.
