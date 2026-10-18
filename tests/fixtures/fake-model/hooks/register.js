@@ -21,6 +21,7 @@ export function register(on) {
       await $.fs.write(home + '/' + name + '.step' + e.index, String(Date.now()));
       await $.process.run(['python3', '-c', 'import time; time.sleep(float(__import__("sys").argv[1]))', delay || '1'],
         {timeoutMs: (Number(delay || 1) + 30) * 1000});
+      await $.fs.write(home + '/' + name + '.end' + e.index, String(Date.now()));
       const input = {command:'sleep 1', description:'Local slot test tool', timeout:30000};
       yield {kind:'tool',index:0,id:'step-tool-'+e.index,name:'Bash'};
       yield {kind:'input',index:0,json:JSON.stringify(input)};

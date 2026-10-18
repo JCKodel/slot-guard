@@ -180,11 +180,17 @@ async function heartbeat($,{held,orphans,pausedUntil,parked}) {
       continue;
     }
     keys.push(state.ticket.key);
-    // An agent in a long tool, between model calls, offers its slot like at a tool's start.
-    if(state.busy>0 && state.steps===0 && !state.acquiring) longTools.push(state.ticket.key);
+    if(state.busy>0 && state.steps===0 && !state.acquiring) longTools.push(state);
   }
   if(keys.length) await call($,{op:'touch',keys}).catch(()=>{});
-  if(longTools.length) await call($,{op:'rotate',keys:longTools}).catch(()=>{});
+  // An agent in a long tool, between model calls, offers its slot like at a tool's start.
+  // Decided under the agent's lock: a model call cannot start until the offer is settled.
+  for(const state of longTools) {
+    await locked(state,async()=>{
+      if(state.ticket && state.busy>0 && state.steps===0 && !state.acquiring)
+        await call($,{op:'rotate',keys:[state.ticket.key]}).catch(()=>{});
+    }).catch(()=>{});
+  }
   await flush($,orphans);
 }
 

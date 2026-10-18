@@ -162,6 +162,16 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
         self.assertNotIn('[API:request]',log)
         self.assertNotIn('API error',log)
 
+    def test_client_under_lock_contention_keeps_waiting(self):
+        import fcntl
+        env={**test_environment(),'CLAUDE_SLOT_HOME':str(self.home)}
+        with (self.home/'coordinator.lock').open('a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            p=subprocess.run([sys.executable,'guard.py','client'],cwd=ROOT,env=env,capture_output=True,text=True,timeout=20,
+                             input=json.dumps({'op':'acquire','key':'k','pool':'agent','session':'s','turn':'t','wait':0}))
+        # No Claude ancestor here: the client stops at owner lookup, never at the lock.
+        self.assertNotIn('lock timeout',p.stderr)
+
     def test_lock_failure_never_grants(self):
         import fcntl
         with (self.home/'coordinator.lock').open('a') as lock:
@@ -257,11 +267,16 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
                 time.sleep(.05)
         watcher=threading.Thread(target=watch); watcher.start()
         try:
-            runs=[self.claude(delay=1.5, mode='steps', steps=4) for _ in range(2)]
+            runs=[self.claude(delay=1.5, mode='steps', steps=4, heartbeat=500) for _ in range(2)]
             for sid,p in runs: self.result(p)
         finally:
             done[0]=True; watcher.join()
         self.assertEqual(peak[0],1)
+        # The model calls themselves (start to end) never overlap across sessions.
+        calls=sorted((float((self.home/f'{sid}.step{i}').read_text()), float((self.home/f'{sid}.end{i}').read_text()), sid)
+                     for sid,_ in runs for i in range(4))
+        for (s1,e1,a),(s2,e2,b) in zip(calls,calls[1:]):
+            if a!=b: self.assertLessEqual(e1,s2,f'model calls overlap: {a} until {e1}, {b} from {s2}')
         starts=sorted((float((self.home/f'{sid}.step{i}').read_text()), sid) for sid,_ in runs for i in range(4))
         order=[sid for _,sid in starts]
         switches=sum(a!=b for a,b in zip(order,order[1:]))

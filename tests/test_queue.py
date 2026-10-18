@@ -453,6 +453,17 @@ class AutoQueueTests(unittest.TestCase):
         self.q.operate({'op':'release','key':'b','pool':'agent','session':'s','turn':'b','pid':10,'birth':'b'})
         self.assertEqual((self.state_of('child'), self.state_of('a')), ('granted', 'queued'))
 
+    def test_a_long_wait_earns_the_priority_of_work_under_way(self):
+        q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b'}.get)
+        self.q.db.close(); self.q = q
+        self.q.operate(self.ticket('run'))
+        self.q.operate(self.ticket('prompt'))                 # rank 1
+        self.q.operate(self.ticket('sub1', rank=0))
+        self.assertEqual(self.q.operate(self.ticket('prompt'))['position'], 2)
+        self.q.db.execute("UPDATE tickets SET created=created-301 WHERE key='prompt'"); self.q.db.commit()
+        self.q.operate(self.ticket('sub2', rank=0))
+        self.assertEqual(self.q.operate(self.ticket('prompt'))['position'], 1)
+
     def test_rotate_ignores_other_owners_and_fresh_restarts_the_quantum(self):
         q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b', 11:'c'}.get)
         self.q.db.close(); self.q = q

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1-beta.1
+
+- Fix a race in 0.6.0: the heartbeat chose agents in long tools, then offered their slots after renewing tickets; a model call starting in between could lose its slot mid-call, letting another agent in. The offer is now decided under the agent's lock, the same one a model call's admission takes.
+- `guard.py client` no longer queries status while preparing its configuration, so lock contention keeps an acquiring agent waiting instead of stopping its turn.
+- Aging: a ticket in line for 5 minutes gets the priority of work under way, so prompts and rotated agents never wait indefinitely behind new subagents.
+- The statusline shows the session's best queue position.
+- The integration test checks that simulated model calls never overlap at limit 1, with a fast heartbeat exercising mid-tool offers.
+
 ## 0.6.0-beta.1
 
 - Cooperative multitasking. The limit now counts agents in a model call; tools run on the agent's ticket and never wait for a slot. An agent that has held its slot for the quantum (60 s, `configure --quantum`) hands it to the next in line between model calls (at a tool's start, or every 30 s during a long tool) and queues again; nothing happens when nobody waits. With the limit at 1, agents take turns instead of one holding the slot for its whole turn.

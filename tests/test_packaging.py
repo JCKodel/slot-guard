@@ -26,6 +26,18 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(badge(home,'s1'), 'Agents ■ 1/1 · 2 waiting · ⌛ #2')
             self.assertEqual(badge(home,'s3'), 'Agents ■ 1/1 · 2 waiting')
 
+    def test_badge_shows_the_sessions_best_queue_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)/'state'
+            initialize(home, 1)
+            owner = {'pid':os.getpid(), 'birth':process_identity(os.getpid())}
+            ticket = lambda key, session, **extra: {'op':'acquire','key':key,'pool':'agent','session':session,'turn':key,**owner,**extra}
+            local_call(home, ticket('run', 'x'))
+            local_call(home, ticket('main', 's'))             # queued, rank 1
+            local_call(home, ticket('other', 'y', rank=0))    # queued ahead of it
+            local_call(home, ticket('child', 's', rank=0))    # this session's subagent: position 2
+            self.assertTrue(badge(home, 's').endswith('⌛ #2'), badge(home, 's'))
+
     def test_badge_reads_a_database_not_yet_migrated(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as tmp:

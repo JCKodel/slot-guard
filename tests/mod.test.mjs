@@ -380,3 +380,22 @@ test('a queued (rotated) ticket makes the next model call wait, not the tools',a
   await step(h,{...event,index:1});
   assert.equal(acquires(h).length,3);  // queued once, then granted
 });
+test('a heartbeat offer never lands on a model call that started meanwhile',async()=>{
+  let holdTouch,touching;
+  const h=harness(async d=>{
+    if(d.op==='touch') {touching=true; await new Promise(r=>{holdTouch=r;}); return {};}
+    return d.op==='acquire'?{state:'granted'}:{rotated:[]};
+  });
+  await start(h);await step(h);
+  let finishTool;const tool=h.handlers['tool.call'](h.$,{tool:'Bash',command:'make'},next(()=>new Promise(r=>{finishTool=r;})));
+  await tick();const before=rotates(h).length;
+  const beating=Promise.resolve(h.timers[0]());   // picks the agent in its long tool, then waits on touch
+  while(!touching) await tick();
+  finishTool({});await tool;                      // the tool ends...
+  let endStep;const stepping=drain(h.handlers['turn.step'](h.$,{...event,index:1},
+    next(async function*(){await new Promise(r=>{endStep=r;});return {};})));
+  while(!endStep) await tick();                   // ...and a model call is streaming
+  holdTouch();await beating;await tick();await tick();
+  assert.equal(rotates(h).length,before);
+  endStep();await stepping;
+});

@@ -42,7 +42,7 @@ def badge(home, session):
         # One badge per pool, at the earliest position held by this session.
         positions = {}
         for pool, position in rows:
-            positions.setdefault(pool, position)
+            positions[pool] = min(position, positions.get(pool, position))
         cap = limits['agents']
         limit = cap
         if limits.get('auto', True) and 'effective' in control:

@@ -23,6 +23,7 @@ MAX_MESSAGE = 16384
 DEFAULT_AGENTS = 3  # Lasts a 5-hour window on Claude Max 5x; see README.
 LEASE = 300  # Seconds without renewal before a heartbeating ticket is abandoned.
 QUANTUM = 60  # Seconds an agent keeps its slot before yielding it to one that waits.
+AGING = 300  # Seconds in line after which a ticket gets the priority of work under way.
 TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
 LIVE = "state IN ('queued','granted')"
 # Automatic limit: keep each usage window on pace to end at AUTO_TARGET percent,
@@ -243,6 +244,8 @@ class Queue:
             # When the slot was granted, and the queue position after a rotation (else seq).
             self.db.execute('ALTER TABLE tickets ADD COLUMN since REAL')
             self.db.execute('ALTER TABLE tickets ADD COLUMN pos INTEGER')
+        if 'waited' not in {r['name'] for r in self.db.execute('PRAGMA table_info(tickets)')}:
+            self.db.execute('ALTER TABLE tickets ADD COLUMN waited REAL')  # Back in line since (rotation).
         self.db.commit()
 
     def reap(self):
@@ -321,6 +324,9 @@ class Queue:
             if limit == 0:
                 # Working agents wait at their next step or tool, keeping their FIFO places.
                 self.db.execute("UPDATE tickets SET state='queued' WHERE pool=? AND state='granted'", (pool,))
+            # Aging: no prompt or rotated agent waits behind an endless stream of new subagents.
+            self.db.execute("""UPDATE tickets SET rank=0 WHERE pool=? AND state='queued' AND rank=1
+                AND coalesce(waited, created) <= ?""", (pool, time.time() - AGING))
             used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (pool,)).fetchone()[0]
             free = max(0, limit - used)
             self.db.execute("""UPDATE tickets SET state='granted', since=? WHERE seq IN
@@ -341,7 +347,8 @@ class Queue:
                                (row['pool'], key)).fetchone():
             return False
         last = self.db.execute('SELECT max(coalesce(pos, seq)) FROM tickets').fetchone()[0]
-        self.db.execute("UPDATE tickets SET state='queued', rank=1, pos=?, since=NULL WHERE key=?", (last + 1, key))
+        self.db.execute("UPDATE tickets SET state='queued', rank=1, pos=?, since=NULL, waited=? WHERE key=?",
+                        (last + 1, now, key))
         return True
 
     @staticmethod
@@ -536,7 +543,7 @@ def local_call(home, data):
         time.sleep(min(2 if result.get('paused_until') else 0.25, max(0, deadline-time.monotonic())))
 
 
-def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=None, quantum=None):
+def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=None, quantum=None, report=True):
     """Create or (replace=True) update the configuration; None keeps a configured value."""
     if agents is not None and (type(agents) is not int or agents < 1):
         raise ValueError('Agent limit must be a positive integer')
@@ -588,7 +595,9 @@ def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=No
                 f.flush()
                 os.fsync(f.fileno())
             temporary.replace(config)
-    return local_call(home, {'op':'status'})
+    # The client only needs the configuration: a status call here would fail under lock
+    # contention before an acquire could keep waiting for its turn.
+    return local_call(home, {'op':'status'}) if report else None
 
 
 def main():
@@ -625,7 +634,7 @@ def main():
     elif args.command == 'evict':
         print(json.dumps(local_call(args.home, {'op':'evict', 'seqs':args.seqs}), indent=2))
     else:
-        initialize(args.home)
+        initialize(args.home, report=False)
         data = json.loads(sys.stdin.read(MAX_MESSAGE))
         if data.get('op') not in ('status', 'evict'):
             data.update(claude_owner())
