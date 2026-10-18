@@ -232,6 +232,16 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
         # The step held its slot for 4 s; the real engine's timer must have renewed it meanwhile.
         self.assertGreaterEqual(len(renewals),3,renewals)
 
+    def test_spent_window_pauses_until_reset_then_resumes_unattended(self):
+        local_call(self.home,{'op':'usage','readings':[{'kind':'five_hour','percent':96,'resets':time.time()+6}]})
+        self.assertEqual(self.status(),[])
+        sid,p=self.claude()
+        time.sleep(3)
+        self.assertFalse((self.home/(sid+'.started')).exists())
+        self.assertEqual([t['state'] for t in self.status() if t['session']==sid],['queued'])
+        self.result(p)
+        self.assertTrue((self.home/(sid+'.finished')).exists())
+
     def test_interrupt_waiting_turn_keeps_session_usable(self):
         for i in range(4): local_call(self.home,self.ticket(str(i)))
         sid,p=self.claude(stream=True)

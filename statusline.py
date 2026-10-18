@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import time
 
 
 def slot_bar(label, used, limit):
@@ -24,6 +25,10 @@ def badge(home, session):
         with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True, timeout=.1)) as conn:
             used = dict(conn.execute("SELECT pool,count(*) FROM tickets WHERE state='granted' GROUP BY pool"))
             queued = dict(conn.execute("SELECT pool,count(*) FROM tickets WHERE state='queued' GROUP BY pool"))
+            try:
+                control = dict(conn.execute('SELECT name,value FROM control'))
+            except sqlite3.OperationalError:
+                control = {}  # Created by the first coordinator call of 0.5.0.
             rows = conn.execute("""SELECT t.pool,
                 (SELECT count(*) FROM tickets q
                  WHERE q.pool=t.pool AND q.state='queued' AND q.seq<=t.seq)
@@ -33,7 +38,17 @@ def badge(home, session):
         positions = {}
         for pool, position in rows:
             positions.setdefault(pool, position)
-        summary = slot_bar('Agents', used.get('agent', 0), limits['agents'])
+        cap = limits['agents']
+        limit = cap
+        if limits.get('auto', True) and 'effective' in control:
+            limit = max(0, min(cap, int(control['effective'])))
+        if limit == 0:
+            until = time.strftime('%H:%M', time.localtime(control.get('until', 0)))
+            summary = f'Agents ⏸ paused until {until} (usage limit near)'
+        else:
+            summary = slot_bar('Agents', used.get('agent', 0), limit)
+        if 0 < limit < cap:
+            summary += f' (auto, max {cap})'
         if queued.get('agent'):
             summary += f" · {queued['agent']} waiting"  # Machine-wide, all sessions.
         waiting = ' · '.join('⌛ #' + str(n) for p,n in positions.items() if p == 'agent')

@@ -24,6 +24,39 @@ DEFAULT_AGENTS = 3  # Lasts a 5-hour window on Claude Max 5x; see README.
 LEASE = 300  # Seconds without renewal before a heartbeating ticket is abandoned.
 TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
 LIVE = "state IN ('queued','granted')"
+# Automatic limit: keep each usage window on pace to end at AUTO_TARGET percent,
+# and pause all agents once a window reaches it, until that window renews.
+WINDOWS = {'five_hour': 5 * 3600, 'seven_day': 7 * 86400}
+AUTO_TARGET = 95.0
+AUTO_STEP = 600     # Seconds between changes of one slot.
+AUTO_WARMUP = 0.05  # Early in a window the pace is too noisy to act on.
+AUTO_BAND = (0.9, 1.1)
+
+
+def pace(percent, resets, length, now, target=AUTO_TARGET):
+    """Share of the budget left over share of the window left; below 1 burns too fast.
+
+    None when the reading cannot be judged: expired, malformed, or too early.
+    """
+    left = (resets - now) / length
+    if not 0 < left <= 1 - AUTO_WARMUP:
+        return None
+    return max(0.0, target - percent) / target / left
+
+
+def auto_limit(current, cap, paces, now, changed):
+    """One step toward pace at most every AUTO_STEP; the fixed limit without data."""
+    if not paces:
+        return cap, changed
+    current = max(1, min(current, cap))
+    if now - changed < AUTO_STEP:
+        return current, changed
+    worst = min(paces)
+    if worst < AUTO_BAND[0] and current > 1:
+        return current - 1, now
+    if worst > AUTO_BAND[1] and current < cap:
+        return current + 1, now
+    return current, changed
 
 
 class BSDInfo(ctypes.Structure):
@@ -113,11 +146,16 @@ def claude_owner():
 
 
 class Queue:
-    def __init__(self, db, agents=DEFAULT_AGENTS, identity=process_identity, lease=LEASE):
+    def __init__(self, db, agents=DEFAULT_AGENTS, identity=process_identity, lease=LEASE,
+                 auto=False, clock=time.time):
         if any(type(n) is not int or n < 1 for n in (agents, lease)):
             raise ValueError('Limits must be positive integers')
         self.identity = identity
+        self.cap = agents
         self.limits = {'agent': agents}
+        self.auto = bool(auto)
+        self.clock = clock
+        self.log = Path(db).parent / 'auto.log'
         self.lease = lease
         self.lock = threading.RLock()  # One connection, shared by threads in tests and tools.
         self.db = sqlite3.connect(db, check_same_thread=False)
@@ -135,6 +173,9 @@ class Queue:
             self.db.execute('ALTER TABLE tickets ADD COLUMN touched REAL')
         if 'instance' not in columns:
             self.db.execute("ALTER TABLE tickets ADD COLUMN instance TEXT NOT NULL DEFAULT ''")
+        self.db.execute('''CREATE TABLE IF NOT EXISTS usage (kind TEXT PRIMARY KEY,
+            percent REAL NOT NULL, resets REAL NOT NULL, seen REAL NOT NULL)''')
+        self.db.execute('CREATE TABLE IF NOT EXISTS control (name TEXT PRIMARY KEY, value REAL NOT NULL)')
         self.db.commit()
 
     def reap(self):
@@ -155,8 +196,49 @@ class Queue:
                             (now - TOMBSTONE,))
             self._promote()
 
+    def windows(self):
+        now = self.clock()
+        return [{'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
+                 'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
+                 'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now)}
+                for r in self.db.execute('SELECT * FROM usage') if r['kind'] in WINDOWS]
+
+    def _control(self):
+        """Set the effective limit; with auto off it is the configured one."""
+        value = dict(self.db.execute('SELECT name,value FROM control'))
+        limit, until = self.cap, 0
+        if self.auto:
+            now = self.clock()
+            windows = [w for w in self.windows() if w['resets'] > now]
+            paces = [w['pace'] for w in windows if w['pace'] is not None]
+            previous = int(value.get('limit', self.cap))
+            spent = [w['resets'] for w in windows if w['percent'] >= AUTO_TARGET]
+            if spent:
+                # Pause everything until the window renews instead of running into the hard limit.
+                limit, until = 0, max(spent)
+                changed = now if previous != 0 else value.get('changed', 0)
+            else:
+                if previous == 0:
+                    previous = self.cap  # A renewed window starts again from the maximum.
+                limit, changed = auto_limit(previous, self.cap, paces, now, value.get('changed', 0))
+            if limit != previous:
+                try:
+                    with self.log.open('a') as f:
+                        f.write(json.dumps({'at': now, 'from': previous, 'to': limit, 'cap': self.cap,
+                                            'paces': [round(p, 2) for p in paces]}) + '\n')
+                except OSError:
+                    pass  # The log is a convenience; admission must not depend on it.
+            self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
+        self.db.execute("INSERT OR REPLACE INTO control VALUES ('effective',?),('until',?)", (limit, until))
+        self.limits['agent'] = limit
+        self.until = until
+
     def _promote(self):
+        self._control()
         for pool, limit in self.limits.items():
+            if limit == 0:
+                # Working agents wait at their next step or tool, keeping their FIFO places.
+                self.db.execute("UPDATE tickets SET state='queued' WHERE pool=? AND state='granted'", (pool,))
             used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (pool,)).fetchone()[0]
             free = max(0, limit - used)
             self.db.execute("""UPDATE tickets SET state='granted' WHERE seq IN
@@ -188,7 +270,12 @@ class Queue:
         op = data.get('op')
         if op == 'status':
             now = time.time()
-            return {'limits': self.limits, 'lease': self.lease, 'tickets': [
+            with self.db:
+                self._control()
+            return {'limits': self.limits, 'lease': self.lease,
+                    'auto': {'enabled': self.auto, 'cap': self.cap, 'target': AUTO_TARGET, 'until': self.until,
+                             'windows': self.windows()} if self.auto else {'enabled': False},
+                    'tickets': [
                 {**dict(r), 'idle': round(now - r['seen'])} for r in self.db.execute(
                     f"""SELECT seq,pool,session,turn,pid,state,coalesce(touched,created) AS seen
                     FROM tickets WHERE {LIVE} ORDER BY seq""")]}
@@ -202,6 +289,27 @@ class Queue:
                                     (time.time(), *seqs)).rowcount
                 self._promote()
             return {'evicted': n}
+        if op == 'usage':
+            readings = data.get('readings')
+            if not isinstance(readings, list) or len(readings) > 8:
+                raise ValueError('Invalid readings')
+            with self.db:
+                for r in readings:
+                    if not isinstance(r, dict) or r.get('kind') not in WINDOWS or any(
+                            type(r.get(k)) not in (int, float) or not 0 <= r[k] < 1e10 for k in ('percent', 'resets')):
+                        raise ValueError('Invalid reading')
+                    row = self.db.execute('SELECT percent,resets FROM usage WHERE kind=?', (r['kind'],)).fetchone()
+                    if row and abs(row['resets'] - r['resets']) <= 60:
+                        # Sessions report the same window from different responses: usage only grows.
+                        percent = max(row['percent'], r['percent'])
+                    elif row and row['resets'] > r['resets']:
+                        continue  # A reading of a window that already ended.
+                    else:
+                        percent = r['percent']
+                    self.db.execute('INSERT OR REPLACE INTO usage VALUES (?,?,?,?)',
+                                    (r['kind'], percent, r['resets'], time.time()))
+                self._promote()
+            return {'limit': self.limits['agent']}
         if op == 'touch':
             self.validate_owner(data)
             keys = data.get('keys')
@@ -253,7 +361,10 @@ class Queue:
         row = self.db.execute('SELECT seq,state FROM tickets WHERE key=?', (data['key'],)).fetchone()
         position = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='queued' AND seq<=?",
                                    (data['pool'], row['seq'])).fetchone()[0]
-        return {'state': row['state'], 'ticket': row['seq'], 'position': position}
+        result = {'state': row['state'], 'ticket': row['seq'], 'position': position}
+        if self.limits['agent'] == 0:
+            result['paused_until'] = self.until
+        return result
 
 
 def local_call(home, data):
@@ -277,7 +388,8 @@ def local_call(home, data):
                     time.sleep(0.025)
             if result is None:
                 config = json.loads((home/'config.json').read_text())
-                q = Queue(home/'queue.sqlite3', config['agents'], lease=config.get('lease', LEASE))
+                q = Queue(home/'queue.sqlite3', config['agents'], lease=config.get('lease', LEASE),
+                          auto=config.get('auto', True))
                 try:
                     q.reap()
                     result = q.operate(data)
@@ -285,11 +397,13 @@ def local_call(home, data):
                     q.db.close()
         if result.get('state') != 'queued' or time.monotonic() >= deadline:
             return result
-        time.sleep(min(0.25, max(0, deadline-time.monotonic())))
+        # A pause lasts until a window renews: poll it gently.
+        time.sleep(min(2 if result.get('paused_until') else 0.25, max(0, deadline-time.monotonic())))
 
 
-def initialize(home, agents=DEFAULT_AGENTS, replace=False):
-    if type(agents) is not int or agents < 1:
+def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None):
+    """Create or (replace=True) update the configuration; None keeps a configured value."""
+    if agents is not None and (type(agents) is not int or agents < 1):
         raise ValueError('Agent limit must be a positive integer')
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(home, 0o700)
@@ -318,9 +432,13 @@ def initialize(home, agents=DEFAULT_AGENTS, replace=False):
             if not replace:
                 agents = min(old['jobs'], old['requests'])
         if replace or old is None or migrating:
+            if agents is None:
+                agents = old['agents'] if old and 'agents' in old else DEFAULT_AGENTS
+            if auto is None:
+                auto = (old or {}).get('auto', True)
             temporary = home/'config.json.tmp'
             with temporary.open('w') as f:
-                json.dump({'agents': agents, 'schema': 2}, f)
+                json.dump({'agents': agents, 'auto': bool(auto), 'schema': 2}, f)
                 f.flush()
                 os.fsync(f.fileno())
             temporary.replace(config)
@@ -334,7 +452,8 @@ def main():
     s = sub.add_parser('init')
     s.add_argument('--agents', type=int, default=DEFAULT_AGENTS)
     c = sub.add_parser('configure')
-    c.add_argument('--agents', type=int, required=True)
+    c.add_argument('--agents', type=int, help='Maximum working agents; the automatic limit never exceeds it')
+    c.add_argument('--auto', choices=('on', 'off'), help='Lower the limit while usage runs ahead of its window')
     sub.add_parser('status')
     e = sub.add_parser('evict', help='Release tickets by number, as listed by status or /slots')
     e.add_argument('seqs', type=int, nargs='+')
@@ -344,7 +463,10 @@ def main():
     if args.command == 'init':
         print(json.dumps(initialize(args.home, args.agents), indent=2))
     elif args.command == 'configure':
-        print(json.dumps(initialize(args.home, args.agents, replace=True), indent=2))
+        if args.agents is None and args.auto is None:
+            p.error('configure needs --agents and/or --auto')
+        auto = None if args.auto is None else args.auto == 'on'
+        print(json.dumps(initialize(args.home, args.agents, replace=True, auto=auto), indent=2))
     elif args.command == 'status':
         print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
     elif args.command == 'evict':

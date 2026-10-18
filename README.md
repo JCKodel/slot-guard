@@ -56,7 +56,26 @@ The right limit depends on your Claude plan: the goal is for the 5-hour usage wi
 
 To calibrate, work normally and watch the 5-hour usage meter (`/usage`, or your statusline). If the window runs out before five hours, lower the limit by one; if a lot remains when it resets, raise it by one. Your usage pattern (model, effort, context size) matters as much as the plan. Measurements for other plans are welcome as issues or pull requests.
 
-The default for new installations is 3. Upgrading keeps your configured limit.
+The default for new installations is 3. Upgrading keeps your configured limit. With the automatic limit below, this value is the maximum, and pacing within it happens by itself.
+
+### Automatic limit
+
+With the automatic limit (on by default), `--agents` is the **maximum** and Slot Guard adjusts the working limit to your real usage. Claude Code reports each usage window (5-hour and weekly) with its percentage used and reset time; the mod passes those figures to the local coordinator, which compares them with how much of the window has elapsed:
+
+- **Ahead of pace** (for example 82% used when 78% of the window has passed): the limit drops by one slot, at most every 10 minutes, down to 1.
+- **Behind pace**: the limit rises by one slot, at most every 10 minutes, up to the maximum.
+- **A window reaches 95%**: every agent pauses, including those already working, at their next model step or tool (nothing running is cut off). They resume by themselves when that window renews, in FIFO order, with no intervention. Running into Claude's own limit would stop everything until you continue it by hand.
+- **No reading** (not on a subscription, or the window has renewed and no session has reported yet): the maximum applies, as with a fixed limit.
+
+The pace aims to finish each window at 95%. The first 5% of a window is not acted on, its pace being too noisy. Lowering the limit never interrupts work in progress; the queue drains to it. Usage from other places (claude.ai, other machines) counts, since the figures are the account's. Every change is logged to `auto.log` in the state directory. A pause only holds once every participating session runs 0.5.0 or later: restart them after updating.
+
+```sh
+python3 guard.py configure --auto off   # fixed limit
+python3 guard.py configure --auto on
+python3 guard.py status                 # limit, maximum, and each window's usage, elapsed time and pace
+```
+
+`/slots` shows the same, and the statusline marks it: `Agents ■■ 2/2 (auto, max 3)`, or `Agents ⏸ paused until 14:05 (usage limit near)`. `configure --auto off` ends a pause at once.
 
 A slot spans inference and ordinary tools, not merely an API response. An agent yields its slot while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt still open after 15 seconds (auto mode's classifier answers sooner and keeps the slot), and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
 
@@ -122,9 +141,9 @@ On macOS, process inspection uses `/usr/lib/libproc.dylib` without another subpr
 
 ### Data, destinations, and credentials
 
-The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, `release`, `touch`, `adopt`, or `evict`), the single `agent` pool, session ID, turn ID, ticket key (including mod load ID, agent ID and admission generation), ticket numbers to evict, and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
+The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, `release`, `touch`, `adopt`, `evict`, or `usage`), the single `agent` pool, session ID, turn ID, ticket key (including mod load ID, agent ID and admission generation), ticket numbers to evict, and the usage windows Claude Code reports to the session (kind, percentage used, reset time), and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
 
-`guard.py` reads/writes `config.json`, `queue.sqlite3` (including SQLite journal files), and local lock/temporary files under `~/.local/state/slot-guard`, or the explicitly configured `CLAUDE_SLOT_HOME`. Stored records contain coordination identifiers, ownership, state, sequence, and creation timestamps. Stored records also carry the last renewal time and the mod load that created them. Released records are deleted when their owner exits, or one hour after release. State remains after uninstall; remove it only after all participating sessions have stopped.
+`guard.py` reads/writes `config.json`, `queue.sqlite3` (including SQLite journal files), and local lock/temporary files under `~/.local/state/slot-guard`, or the explicitly configured `CLAUDE_SLOT_HOME`. Stored records contain coordination identifiers, ownership, state, sequence, and creation timestamps. Stored records also carry the last renewal time and the mod load that created them. The latest usage window figures and the automatic limit's state are kept too. Released records are deleted when their owner exits, or one hour after release. State remains after uninstall; remove it only after all participating sessions have stopped.
 
 The coordinator and badge reader make **no network requests** and have no remote data destination. They do not read project files, transcript files, Claude's credential store, Keychain, API keys, or authentication tokens. Child processes inherit an OS environment normally; the coordinator does not look up or use credential variables. The only environment setting it explicitly reads is `CLAUDE_SLOT_HOME` (home-directory resolution also uses standard OS/Python behavior).
 

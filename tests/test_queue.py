@@ -10,7 +10,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import Queue, initialize, local_call, process_identity
+from guard import AUTO_STEP, Queue, auto_limit, initialize, local_call, pace, process_identity
 
 
 class QueueTests(unittest.TestCase):
@@ -208,6 +208,123 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(local_call(home, {**self.data('a'), **owner})['state'], 'queued')
             with self.assertRaises(RuntimeError):
                 local_call(home, {**self.data('a', op='release'), **owner})
+
+class AutoLimitTests(unittest.TestCase):
+    H = 3600
+    def test_pace_compares_budget_left_with_time_left(self):
+        # 82% used with 78% of a 5 h window gone: well ahead of pace.
+        self.assertAlmostEqual(pace(82, 1.1*self.H, 5*self.H, 0), (13/95)/0.22, places=6)
+        self.assertGreater(pace(30, 3*self.H, 5*self.H, 0), 1)
+        self.assertEqual(pace(99, 2*self.H, 5*self.H, 0), 0)
+
+    def test_pace_ignores_expired_and_early_windows(self):
+        self.assertIsNone(pace(10, -1, 5*self.H, 0))
+        self.assertIsNone(pace(1, 4.9*self.H, 5*self.H, 0))
+        self.assertIsNone(pace(1, 6*self.H, 5*self.H, 0))
+
+    def test_steps_one_slot_at_most_every_interval(self):
+        self.assertEqual(auto_limit(3, 3, [0.6], 1000, 0), (2, 1000))
+        self.assertEqual(auto_limit(2, 3, [0.6], 1000 + AUTO_STEP - 1, 1000), (2, 1000))
+        self.assertEqual(auto_limit(2, 3, [0.6], 1000 + AUTO_STEP, 1000), (1, 1000 + AUTO_STEP))
+
+    def test_floor_cap_deadband_and_worst_window(self):
+        self.assertEqual(auto_limit(1, 3, [0], 10**6, 0), (1, 0))
+        self.assertEqual(auto_limit(3, 3, [5], 10**6, 0), (3, 0))
+        self.assertEqual(auto_limit(2, 3, [1.0], 10**6, 0), (2, 0))
+        self.assertEqual(auto_limit(2, 3, [1.5], 10**6, 0), (3, 10**6))
+        self.assertEqual(auto_limit(3, 3, [1.5, 0.5], 10**6, 0), (2, 10**6))
+        self.assertEqual(auto_limit(5, 3, [1.0], 10**6, 0), (3, 0))
+
+    def test_without_readings_the_configured_limit_applies(self):
+        self.assertEqual(auto_limit(1, 3, [], 10**6, 0), (3, 0))
+
+
+class AutoQueueTests(unittest.TestCase):
+    H = 3600
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.now = 10**6
+        self.q = Queue(Path(self.temp.name)/'q.db', 3, {10:'b'}.get, auto=True, clock=lambda: self.now)
+
+    def tearDown(self):
+        self.q.db.close(); self.temp.cleanup()
+
+    def acquire(self, key):
+        return self.q.operate({'op':'acquire','key':key,'pool':'agent','session':'s','turn':key,'pid':10,'birth':'b'})['state']
+
+    def usage(self, percent, left_hours, kind='five_hour'):
+        return self.q.operate({'op':'usage','readings':[{'kind':kind,'percent':percent,'resets':self.now+left_hours*self.H}]})
+
+    def test_running_ahead_lowers_and_on_pace_restores_without_interrupting(self):
+        for k in 'abc': self.assertEqual(self.acquire(k), 'granted')
+        self.assertEqual(self.usage(82, 1.1)['limit'], 2)
+        self.assertEqual(self.acquire('d'), 'queued')
+        self.q.operate({'op':'release','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'})
+        self.assertEqual(self.acquire('d'), 'queued')  # Still 2 working: b and c.
+        self.now += AUTO_STEP
+        self.usage(10, 4)  # A new window: 10% used, 20% elapsed.
+        self.assertEqual(self.acquire('d'), 'granted')
+        self.assertTrue((Path(self.temp.name)/'auto.log').read_text().count('\n') >= 2)
+
+    def test_readings_merge_by_window_and_keep_the_highest(self):
+        self.usage(50, 2)
+        self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':45,'resets':self.now+2*self.H+5}]})
+        self.assertEqual(self.q.windows()[0]['percent'], 50)
+        self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':90,'resets':self.now-5*self.H}]})
+        self.assertEqual(self.q.windows()[0]['percent'], 50)
+
+    def test_weekly_window_counts_and_status_reports(self):
+        self.usage(10, 4)
+        self.usage(90, 24*3, kind='seven_day')
+        status = self.q.operate({'op':'status'})
+        self.assertEqual(status['limits']['agent'], 2)
+        self.assertEqual(status['auto']['cap'], 3)
+        self.assertEqual({w['kind'] for w in status['auto']['windows']}, {'five_hour', 'seven_day'})
+
+    def test_expired_window_returns_to_configured_limit(self):
+        self.usage(82, 1.1)
+        self.now += 2*self.H
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
+
+    def test_invalid_readings_are_refused(self):
+        for bad in ([{'kind':'five_hour','percent':'x','resets':1}], [{'kind':'five_hour','percent':1}], 'x'):
+            with self.assertRaises(ValueError):
+                self.q.operate({'op':'usage','readings':bad})
+
+    def test_spent_window_pauses_everyone_until_it_renews(self):
+        for k in 'ab': self.acquire(k)
+        self.usage(95, 0.5)
+        status = self.q.operate({'op':'status'})
+        self.assertEqual(status['limits']['agent'], 0)
+        self.assertEqual(status['auto']['until'], self.now + 0.5*self.H)
+        self.assertEqual([t['state'] for t in status['tickets']], ['queued', 'queued'])
+        self.assertEqual(self.acquire('c'), 'queued')
+        self.now += 0.5*self.H + 1
+        self.assertEqual(self.acquire('a'), 'granted')
+        self.assertEqual([t['state'] for t in self.q.operate({'op':'status'})['tickets']], ['granted']*3)
+
+    def test_after_a_pause_the_maximum_returns_at_once_with_both_windows(self):
+        self.usage(95, 0.5)
+        self.usage(50, 24*3, kind='seven_day')
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 0)
+        self.now += 5*60
+        self.assertIn('paused_until', self.q.operate({'op':'acquire','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'}))
+        self.now += 0.5*self.H
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
+
+    def test_weekly_window_pause_also_ends_at_its_reset(self):
+        self.usage(96, 30, kind='seven_day')
+        self.assertEqual(self.acquire('a'), 'queued')
+        self.now += 31*self.H
+        self.assertEqual(self.acquire('a'), 'granted')
+
+    def test_auto_off_ignores_usage(self):
+        q = Queue(Path(self.temp.name)/'q2.db', 3, {10:'b'}.get, auto=False, clock=lambda: self.now)
+        try:
+            q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':99,'resets':self.now+self.H}]})
+            self.assertEqual(q.operate({'op':'status'})['limits']['agent'], 3)
+        finally:
+            q.db.close()
 
 
 if __name__ == '__main__': unittest.main()

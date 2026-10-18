@@ -3,17 +3,18 @@ import assert from 'node:assert/strict';
 import {register} from '../hooks/register.js';
 
 function harness(respond=async()=>({state:'granted'})) {
-  const handlers={}, fallbacks={},calls=[],aborts=[],timers=[],afters=[];
+  const handlers={}, fallbacks={},calls=[],aborts=[],timers=[],afters=[],statuses=[];
   register((event,matcher,handler)=>{handlers[event]=handler||matcher;return {catch(fn){fallbacks[event]=fn;}};});
-  const $={plugin:{root:'/plugin'},session:{id:async()=> 'session'},
+  const $={plugin:{root:'/plugin'},session:{id:async()=> 'session',usage:async()=>$.usage},
     process:{run:async(argv,opts)=>{
       assert.deepEqual(argv,['python3','guard.py','client']);assert.equal(opts.cwd,'/plugin');
       const data=JSON.parse(opts.stdin);calls.push(data);
       return {exitCode:0,stdout:JSON.stringify(await respond(data)),stderr:''};
-    }},ui:{status(){}},turn:{abort:async e=>{aborts.push(e.turnId);}},
+    }},ui:{status(t){statuses.push(t);}},turn:{abort:async e=>{aborts.push(e.turnId);}},
+    usage:{rateLimits:[]},
     command:{register:async()=>{}},env:{get:async()=>undefined},clock:{every:(ms,fn)=>{timers.push(fn);return {cancel(){}};},
       after:(ms,fn)=>{const t={ms,fn,cancelled:false,cancel(){t.cancelled=true;}};afters.push(t);return t;}}};
-  return {handlers,fallbacks,calls,aborts,timers,afters,$};
+  return {handlers,fallbacks,calls,aborts,timers,afters,statuses,$};
 }
 const event={turnId:'turn',index:0};
 function next(fn=async()=>({})) {fn.signal=new AbortController().signal;return fn;}
@@ -237,4 +238,34 @@ test('an ask answered quickly (auto mode classifier) keeps the slot',async()=>{
   assert.equal(h.calls.filter(c=>c.op==='release').length,0);
   await step(h,{...event,index:1});
   assert.equal(new Set(h.calls.filter(c=>c.op==='acquire').map(c=>c.key)).size,1);
+});
+test('usage windows are reported on measure and by the heartbeat, once per change',async()=>{
+  const h=harness(async d=>d.op==='usage'?{limit:2}:{state:'granted'});await start(h);
+  const limits=[{kind:'five_hour',percentUsed:82,resetsAt:'2026-10-18T03:00:00Z'},{kind:'spend_limit',percentUsed:5}];
+  await h.handlers['session.measure'](h.$,{changed:['rateLimits'],rateLimits:limits},async()=>({}));
+  const sent=h.calls.filter(c=>c.op==='usage');
+  assert.deepEqual(sent[0].readings,[{kind:'five_hour',percent:82,resets:Date.parse('2026-10-18T03:00:00Z')/1000}]);
+  h.$.usage.rateLimits=limits;await beat(h);
+  assert.equal(h.calls.filter(c=>c.op==='usage').length,1);
+  h.$.usage.rateLimits=[{...limits[0],percentUsed:83}];await beat(h);
+  assert.equal(h.calls.filter(c=>c.op==='usage').length,2);
+  await h.handlers['session.measure'](h.$,{changed:['context'],rateLimits:[]},async()=>({}));
+  assert.equal(h.calls.filter(c=>c.op==='usage').length,2);
+});
+test('slots shows the automatic limit and window pace',async()=>{
+  const h=harness(async()=>({limits:{agent:2},auto:{enabled:true,cap:3,target:95,
+    windows:[{kind:'five_hour',percent:82,elapsed:78,pace:0.62}]},tickets:[]}));
+  const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
+  assert.match(r.text,/Auto limit: 2 of max 3, pacing to 95% per window; five_hour 82% used, 78% elapsed, pace 0.62/);
+});
+test('slots explains a pause and when it ends',async()=>{
+  const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,windows:[]},tickets:[]}));
+  const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
+  assert.match(r.text,/Paused: a usage window reached 95%; agents resume when it renews at/);
+});
+test('a paused agent says why and clears the notice when it resumes',async()=>{
+  let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000}:{state:'granted'});
+  await step(h);
+  assert.equal(h.statuses.filter(t=>t&&/paused until/.test(t)).length,1);
+  assert.equal(h.statuses.at(-1),undefined);
 });

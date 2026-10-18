@@ -26,6 +26,21 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(badge(home,'s1'), 'Agents ■ 1/1 · 2 waiting · ⌛ #2')
             self.assertEqual(badge(home,'s3'), 'Agents ■ 1/1 · 2 waiting')
 
+    def test_badge_shows_automatic_limit_below_maximum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)/'state'
+            initialize(home, 3)
+            import time
+            now = time.time()
+            local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':82,'resets':now+1.1*3600}]})
+            self.assertEqual(badge(home,''), 'Agents □□ 0/2 (auto, max 3)')
+            local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':96,'resets':now+1.1*3600}]})
+            expected = time.strftime('%H:%M', time.localtime(now+1.1*3600))
+            self.assertEqual(badge(home,''), f'Agents ⏸ paused until {expected} (usage limit near)')
+            initialize(home, None, replace=True, auto=False)
+            local_call(home, {'op':'status'})
+            self.assertEqual(badge(home,''), 'Agents □□□ 0/3')
+
     def test_parallel_first_install_preserves_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)/'state'

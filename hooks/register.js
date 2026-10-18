@@ -16,14 +16,18 @@ async function call($, data) {
 }
 // Resolves true when granted, false when the ticket was released (canceled, evicted, expired).
 async function acquire($, ticket, signal) {
-  let first=true;
+  let first=true, paused=false;
   for (;;) {
     signal.throwIfAborted();
     const r=await call($,{...ticket,op:'acquire',wait:first?0:15});
     first=false;
     signal.throwIfAborted();
-    if(r.state==='granted') return true;
+    if(r.state==='granted') {if(paused) $.ui.status(undefined); return true;}
     if(r.state!=='queued') return false;
+    if(r.paused_until && !paused) {
+      paused=true;
+      $.ui.status(`Slot Guard: paused until ${new Date(r.paused_until*1000).toLocaleTimeString()}, a usage window is near its limit`);
+    }
   }
 }
 // Serialize state transitions, not work: tools of one agent can run in parallel.
@@ -100,6 +104,17 @@ async function flush($,orphans) {
     try {await call($,{...ticket,op:'release'}); orphans.delete(key);} catch {}
   }
 }
+// Usage windows the automatic limit paces against; the coordinator keeps the latest.
+const readingsOf = limits => (limits||[])
+  .filter(r=>r.kind==='five_hour' || r.kind==='seven_day')
+  .map(r=>({kind:r.kind,percent:r.percentUsed,resets:Date.parse(r.resetsAt)/1000}))
+  .filter(r=>Number.isFinite(r.percent) && Number.isFinite(r.resets));
+async function report($,registry,limits) {
+  const readings=readingsOf(limits), signature=JSON.stringify(readings);
+  if(!readings.length || signature===registry.reported) return;
+  await call($,{op:'usage',readings});
+  registry.reported=signature;
+}
 async function heartbeat($,{held,orphans}) {
   const now=Date.now(), keys=[];
   for(const state of held) {
@@ -120,7 +135,7 @@ async function heartbeat($,{held,orphans}) {
 export function register(on) {
   const states=new Map();
   // States holding a ticket (closed ones still unwinding too), and tickets whose release failed.
-  const registry={held:new Set(),orphans:new Map()};
+  const registry={held:new Set(),orphans:new Map(),reported:''};
   const pending=new Map();  // tool_use_id -> the admitted call, so a permission ask can yield it.
   const key=e=>e.agentId||'main';
   let timer=null;
@@ -133,6 +148,7 @@ export function register(on) {
       const every=Number(await $.env.get('SLOT_HEARTBEAT_MS'))||HEARTBEAT_MS;  // Tests shorten it.
       timer=$.clock.every(every,()=>{
         heartbeat($,registry).catch(()=>{});
+        $.session.usage().then(u=>report($,registry,u.rateLimits)).catch(()=>{});
         const now=Date.now();
         for(const [k,state] of states)
           if(!state.ticket && state.busy===0 && state.waiting===0 && now-state.active>FORGET_MS) states.delete(k);
@@ -152,9 +168,18 @@ export function register(on) {
       const s=await call($,{op:'status'});
       const count=state=>s.tickets.filter(t=>t.state===state).length;
       const lines=s.tickets.map(t=>`#${t.seq} ${t.state} session ${t.session.slice(0,8)} pid ${t.pid}, renewed ${t.idle}s ago`);
-      return {text:[`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot.`,...lines].join('\n')};
+      const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
+        [`Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "python3 guard.py configure --auto off" resumes now.`] : [];
+      const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} of max ${s.auto.cap}, pacing to ${s.auto.target}% per window`+
+        (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
+      return {text:[`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot.`,...auto,...lines].join('\n')};
     } catch(error) {return {text:'Slot Guard: '+String(error)};}
   });
+  // Pushed when a usage window moves a whole point; the heartbeat covers quiet periods.
+  on('session.measure',async($,e,next)=>{
+    if(e.changed.includes('rateLimits')) await report($,registry,e.rateLimits).catch(()=>{});
+    return next(e);
+  }).catch(($,e,next)=>next(e));
   on('turn.step',async function*($,e,next){
     const k=key(e);
     let state=states.get(k);

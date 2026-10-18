@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-beta.1
+
+- Automatic limit (on by default): `--agents` becomes the maximum. Using the usage windows Claude Code reports (5-hour and weekly), the limit drops a slot while usage runs ahead of the window's elapsed time and rises while it runs behind, at most one slot per 10 minutes, aiming to end each window at 95%.
+- When a window reaches 95%, all agents pause at their next step or tool and resume by themselves when the window renews, in FIFO order.
+- `configure --auto on|off`; `status` and `/slots` show the limit, maximum, and each window's usage, elapsed time and pace; changes are logged to `auto.log`.
+- Statusline: `(auto, max N)` below the maximum, `⏸ paused until HH:MM` during a pause.
+
 ## 0.4.2-beta.1
 
 - New installations default to 3 working-agent slots instead of 4. Existing configurations keep their limit.
