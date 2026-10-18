@@ -60,22 +60,25 @@ The default for new installations is 3. Upgrading keeps your configured limit. W
 
 ### Automatic limit
 
-With the automatic limit (on by default), `--agents` is the **maximum** and Slot Guard adjusts the working limit to your real usage. Claude Code reports each usage window (5-hour and weekly) with its percentage used and reset time; the mod passes those figures to the local coordinator, which compares them with how much of the window has elapsed:
+With the automatic limit (on by default), `--agents` is the **normal** limit and Slot Guard adjusts the working limit to your real usage. By default it never goes above it; `--max N` lets it go up to N agents while every window has plenty left. Claude Code reports each usage window (5-hour and weekly) with its percentage used and reset time; the mod passes those figures to the local coordinator, which compares them with how much of the window has elapsed:
 
-- **Ahead of pace** (for example 82% used when 78% of the window has passed): the limit drops by one slot, at most every 10 minutes, down to 1.
-- **Behind pace**: the limit rises by one slot, at most every 10 minutes, up to the maximum.
-- **A window reaches 95%**: every agent pauses, including those already working, at their next model step or tool (nothing running is cut off). They resume by themselves when that window renews, in FIFO order, with no intervention. Running into Claude's own limit would stop everything until you continue it by hand.
+- **Ahead of pace**, judged two ways, the worse one deciding: the average burn so far (14% used after 10% of the window) and the budget left for the time left (82% used with 78% gone). The limit drops by one slot, at most every 10 minutes.
+- **Behind pace**: the limit rises by one slot, at most every 10 minutes, back to the normal limit.
+- **Plenty left** (with `--max`): above the normal limit only while every window, weekly included, has a pace above 1.25, one slot every 10 minutes up to the maximum; it returns toward normal once any window falls under 1.1.
+- **The 5-hour window** acts at 10% off pace and can go down to 1 agent. **The weekly window** is more tolerant: it only lowers the limit at twice the sustainable pace, never below 2 agents, and does not hold back a rise while within that tolerance.
+- **A window reaches 95%**: every agent pauses, including those already working, at their next model step or tool (nothing running is cut off). They resume by themselves when that window renews, in FIFO order, with no intervention. Running into Claude's own limit would stop everything until you continue it by hand. Claude Code gives up on a subagent's model step after 10 minutes; a subagent paused longer ends with a message telling its parent, itself paused, to dispatch it again after the renewal.
 - **No reading** (not on a subscription, or the window has renewed and no session has reported yet): the maximum applies, as with a fixed limit.
 
-The pace aims to finish each window at 95%. The first 5% of a window is not acted on, its pace being too noisy. Lowering the limit never interrupts work in progress; the queue drains to it. Usage from other places (claude.ai, other machines) counts, since the figures are the account's. Every change is logged to `auto.log` in the state directory. A pause only holds once every participating session runs 0.5.0 or later: restart them after updating.
+The pace aims to finish each window at 95%. The first 15 minutes of a window are not acted on, their pace being too noisy. Lowering the limit never interrupts work in progress; the queue drains to it. Usage from other places (claude.ai, other machines) counts, since the figures are the account's. Every change is logged to `auto.log` in the state directory. A pause only holds once every participating session runs 0.5.0 or later: restart them after updating.
 
 ```sh
+python3 guard.py configure --max 5      # allow up to 5 while there is plenty left
 python3 guard.py configure --auto off   # fixed limit
 python3 guard.py configure --auto on
 python3 guard.py status                 # limit, maximum, and each window's usage, elapsed time and pace
 ```
 
-`/slots` shows the same, and the statusline marks it: `Agents ■■ 2/2 (auto, max 3)`, or `Agents ⏸ paused until 14:05 (usage limit near)`. `configure --auto off` ends a pause at once.
+`/slots` shows the same, and the statusline marks it: `Agents ■■ 2/2 (auto, normal 3)`, or `Agents ⏸ paused until 14:05 (usage limit near)`. `configure --auto off` ends a pause at once.
 
 A slot spans inference and ordinary tools, not merely an API response. An agent yields its slot while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt still open after 15 seconds (auto mode's classifier answers sooner and keeps the slot), and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
 

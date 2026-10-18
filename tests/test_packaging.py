@@ -33,7 +33,7 @@ class PackagingTests(unittest.TestCase):
             import time
             now = time.time()
             local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':82,'resets':now+1.1*3600}]})
-            self.assertEqual(badge(home,''), 'Agents □□ 0/2 (auto, max 3)')
+            self.assertEqual(badge(home,''), 'Agents □□ 0/2 (auto, normal 3)')
             local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':96,'resets':now+1.1*3600}]})
             expected = time.strftime('%H:%M', time.localtime(now+1.1*3600))
             self.assertEqual(badge(home,''), f'Agents ⏸ paused until {expected} (usage limit near)')

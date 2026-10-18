@@ -1,5 +1,6 @@
 import concurrent.futures
 import fcntl
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -211,29 +212,58 @@ class QueueTests(unittest.TestCase):
 
 class AutoLimitTests(unittest.TestCase):
     H = 3600
-    def test_pace_compares_budget_left_with_time_left(self):
-        # 82% used with 78% of a 5 h window gone: well ahead of pace.
+    def test_pace_takes_the_worse_of_average_and_remaining(self):
+        # 14% used after 30 min of a 5 h window: the average burn decides.
+        self.assertAlmostEqual(pace(14, 4.5*self.H, 5*self.H, 0), 0.1*95/14, places=6)
+        # 82% used with 78% gone: the remaining budget decides.
         self.assertAlmostEqual(pace(82, 1.1*self.H, 5*self.H, 0), (13/95)/0.22, places=6)
-        self.assertGreater(pace(30, 3*self.H, 5*self.H, 0), 1)
+        self.assertGreater(pace(30, 2*self.H, 5*self.H, 0), 1)
         self.assertEqual(pace(99, 2*self.H, 5*self.H, 0), 0)
+        self.assertGreater(pace(0, 4*self.H, 5*self.H, 0), 1)
 
-    def test_pace_ignores_expired_and_early_windows(self):
+    def test_pace_ignores_expired_and_first_minutes(self):
         self.assertIsNone(pace(10, -1, 5*self.H, 0))
-        self.assertIsNone(pace(1, 4.9*self.H, 5*self.H, 0))
+        self.assertIsNone(pace(1, 5*self.H - 600, 5*self.H, 0))
+        self.assertIsNotNone(pace(1, 5*self.H - 1000, 5*self.H, 0))
         self.assertIsNone(pace(1, 6*self.H, 5*self.H, 0))
 
     def test_steps_one_slot_at_most_every_interval(self):
-        self.assertEqual(auto_limit(3, 3, [0.6], 1000, 0), (2, 1000))
-        self.assertEqual(auto_limit(2, 3, [0.6], 1000 + AUTO_STEP - 1, 1000), (2, 1000))
-        self.assertEqual(auto_limit(2, 3, [0.6], 1000 + AUTO_STEP, 1000), (1, 1000 + AUTO_STEP))
+        five = lambda p: [('five_hour', p)]
+        self.assertEqual(auto_limit(3, 3, five(0.6), 1000, 0), (2, 1000))
+        self.assertEqual(auto_limit(2, 3, five(0.6), 1000 + AUTO_STEP - 1, 1000), (2, 1000))
+        self.assertEqual(auto_limit(2, 3, five(0.6), 1000 + AUTO_STEP, 1000), (1, 1000 + AUTO_STEP))
 
-    def test_floor_cap_deadband_and_worst_window(self):
-        self.assertEqual(auto_limit(1, 3, [0], 10**6, 0), (1, 0))
-        self.assertEqual(auto_limit(3, 3, [5], 10**6, 0), (3, 0))
-        self.assertEqual(auto_limit(2, 3, [1.0], 10**6, 0), (2, 0))
-        self.assertEqual(auto_limit(2, 3, [1.5], 10**6, 0), (3, 10**6))
-        self.assertEqual(auto_limit(3, 3, [1.5, 0.5], 10**6, 0), (2, 10**6))
-        self.assertEqual(auto_limit(5, 3, [1.0], 10**6, 0), (3, 0))
+    def test_five_hour_floor_cap_and_deadband(self):
+        T = 10**6
+        self.assertEqual(auto_limit(1, 3, [('five_hour', 0)], T, 0), (1, 0))
+        self.assertEqual(auto_limit(3, 3, [('five_hour', 5)], T, 0), (3, 0))
+        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.0)], T, 0), (2, 0))
+        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.5)], T, 0), (3, T))
+        self.assertEqual(auto_limit(5, 3, [('five_hour', 1.0)], T, 0), (3, 0))
+
+    def test_weekly_window_is_tolerant_and_keeps_two_agents(self):
+        T = 10**6
+        self.assertEqual(auto_limit(3, 3, [('seven_day', 0.6)], T, 0), (3, 0))
+        self.assertEqual(auto_limit(3, 3, [('seven_day', 0.4)], T, 0), (2, T))
+        self.assertEqual(auto_limit(2, 3, [('seven_day', 0.1)], T, 0), (2, 0))
+        # Within its tolerance the weekly window does not hold back a rise.
+        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.5), ('seven_day', 0.6)], T, 0), (3, T))
+        # Below it, nothing rises; the five-hour window can still go under two.
+        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.5), ('seven_day', 0.4)], T, 0), (2, 0))
+        self.assertEqual(auto_limit(2, 3, [('five_hour', 0.5), ('seven_day', 0.4)], T, 0), (1, T))
+        self.assertEqual(auto_limit(1, 1, [('seven_day', 0.1)], T, 0), (1, 0))
+
+    def test_above_normal_only_with_room_in_every_window(self):
+        T = 10**6
+        lots = [('five_hour', 1.4), ('seven_day', 1.3)]
+        self.assertEqual(auto_limit(3, 3, lots, T, 0, 5), (4, T))
+        self.assertEqual(auto_limit(5, 3, lots, T, 0, 5), (5, 0))
+        self.assertEqual(auto_limit(3, 3, lots, T, 0), (3, 0))  # No maximum configured.
+        self.assertEqual(auto_limit(3, 3, [('five_hour', 1.4), ('seven_day', 1.2)], T, 0, 5), (3, 0))
+        self.assertEqual(auto_limit(4, 3, [('five_hour', 1.15), ('seven_day', 1.2)], T, 0, 5), (4, 0))
+        self.assertEqual(auto_limit(5, 3, [('five_hour', 1.05), ('seven_day', 1.3)], T, 0, 5), (4, T))
+        self.assertEqual(auto_limit(5, 3, [('five_hour', 0.8)], T, 0, 5), (4, T))
+        self.assertEqual(auto_limit(5, 3, [], T, 0, 5), (3, 0))
 
     def test_without_readings_the_configured_limit_applies(self):
         self.assertEqual(auto_limit(1, 3, [], 10**6, 0), (3, 0))
@@ -277,7 +307,7 @@ class AutoQueueTests(unittest.TestCase):
         self.usage(10, 4)
         self.usage(90, 24*3, kind='seven_day')
         status = self.q.operate({'op':'status'})
-        self.assertEqual(status['limits']['agent'], 2)
+        self.assertEqual(status['limits']['agent'], 2)  # The weekly window, far ahead, keeps two.
         self.assertEqual(status['auto']['cap'], 3)
         self.assertEqual({w['kind'] for w in status['auto']['windows']}, {'five_hour', 'seven_day'})
 
@@ -312,11 +342,32 @@ class AutoQueueTests(unittest.TestCase):
         self.now += 0.5*self.H
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
 
+    def test_no_lease_expires_during_a_pause(self):
+        self.q.lease = 300
+        self.acquire('a')
+        self.usage(95, 1)
+        self.q.db.execute("UPDATE tickets SET instance='mod', touched=touched-1000, created=created-1000")
+        self.q.reap()
+        self.assertEqual(self.q.db.execute("SELECT state FROM tickets WHERE key='a'").fetchone()[0], 'queued')
+        self.now += 1.01*self.H
+        self.q.operate({'op':'status'})
+        self.q.reap()
+        self.assertEqual(self.q.db.execute("SELECT state FROM tickets WHERE key='a'").fetchone()[0], 'released')
+
     def test_weekly_window_pause_also_ends_at_its_reset(self):
         self.usage(96, 30, kind='seven_day')
         self.assertEqual(self.acquire('a'), 'queued')
         self.now += 31*self.H
         self.assertEqual(self.acquire('a'), 'granted')
+
+    def test_configured_maximum_reaches_queue_and_status(self):
+        home = Path(self.temp.name)/'home'
+        initialize(home, 3)
+        result = initialize(home, None, replace=True, ceiling=5)
+        self.assertEqual(result['auto']['max'], 5)
+        self.assertEqual(json.loads((home/'config.json').read_text())['max'], 5)
+        self.assertEqual(initialize(home, 4, replace=True)['auto']['max'], 5)
+        self.assertNotIn('max', json.loads(initialize(home, 6, replace=True) and (home/'config.json').read_text()))
 
     def test_auto_off_ignores_usage(self):
         q = Queue(Path(self.temp.name)/'q2.db', 3, {10:'b'}.get, auto=False, clock=lambda: self.now)

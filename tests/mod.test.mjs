@@ -256,7 +256,7 @@ test('slots shows the automatic limit and window pace',async()=>{
   const h=harness(async()=>({limits:{agent:2},auto:{enabled:true,cap:3,target:95,
     windows:[{kind:'five_hour',percent:82,elapsed:78,pace:0.62}]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/Auto limit: 2 of max 3, pacing to 95% per window; five_hour 82% used, 78% elapsed, pace 0.62/);
+  assert.match(r.text,/Auto limit: 2 \(normal 3, max 3\), pacing to 95% per window; five_hour 82% used, 78% elapsed, pace 0.62/);
 });
 test('slots explains a pause and when it ends',async()=>{
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,windows:[]},tickets:[]}));
@@ -268,4 +268,31 @@ test('a paused agent says why and clears the notice when it resumes',async()=>{
   await step(h);
   assert.equal(h.statuses.filter(t=>t&&/paused until/.test(t)).length,1);
   assert.equal(h.statuses.at(-1),undefined);
+});
+test('idle release waits while usage is paused',async(t)=>{
+  let n=0;const h=harness(async d=>d.op==='acquire'&&++n===1?{state:'queued',paused_until:Date.now()/1000+3600}:{state:'granted'});
+  await start(h);await step(h);const k=h.calls.find(c=>c.op==='acquire').key;
+  const now=Date.now();t.mock.method(Date,'now',()=>now+121000);
+  await beat(h);assert.equal(released(h,k),0);
+});
+test('an abandoned dispatch does not abort the turn again',async()=>{
+  const controller=new AbortController();
+  const h=harness(async()=>{controller.abort();throw new Error('aborted');});
+  const n=async function*(){};n.signal=controller.signal;
+  await drain(h.handlers['turn.step'](h.$,event,n));
+  assert.equal(h.aborts.length,0);
+});
+test('a subagent turn that cannot be aborted still never reaches the model',async()=>{
+  const h=harness(async()=>{throw new Error('offline');});
+  h.$.turn.abort=async()=>{throw new Error('not the running turn');};
+  let called=0;
+  const out=await drain(h.handlers['turn.step'](h.$,{turnId:'child',agentId:'c',index:0},next(async function*(){called++;})));
+  assert.equal(called,0);assert.equal(out.answer,'');
+});
+test('a paused subagent abandoned by the engine tells its parent to retry',async()=>{
+  const controller=new AbortController();
+  const h=harness(async d=>{if(d.op==='acquire'){controller.abort();return {state:'queued',paused_until:Date.now()/1000+600};}return {};});
+  const n=async function*(){throw new Error('must not run');};n.signal=controller.signal;
+  const out=await drain(h.handlers['turn.step'](h.$,{turnId:'c',agentId:'child',index:0},n));
+  assert.match(out.answer,/Dispatch it again after/);assert.equal(h.aborts.length,0);
 });

@@ -29,32 +29,55 @@ LIVE = "state IN ('queued','granted')"
 WINDOWS = {'five_hour': 5 * 3600, 'seven_day': 7 * 86400}
 AUTO_TARGET = 95.0
 AUTO_STEP = 600     # Seconds between changes of one slot.
-AUTO_WARMUP = 0.05  # Early in a window the pace is too noisy to act on.
-AUTO_BAND = (0.9, 1.1)
+AUTO_WARMUP = 900   # Seconds: a window's first minutes are too noisy to act on.
+# Per window: below `low` the window votes a slot down (not under `floor`); above `high` it
+# lets the limit rise. The weekly window only acts at twice the pace and keeps two agents.
+AUTO_BOOST = (1.1, 1.25)  # Above the normal limit: rise only past 1.25 everywhere, return under 1.1.
+AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
+               'seven_day': {'low': 0.5, 'high': 0.5, 'floor': 2}}
 
 
 def pace(percent, resets, length, now, target=AUTO_TARGET):
-    """Share of the budget left over share of the window left; below 1 burns too fast.
+    """How sustainable usage is: 1 on pace to end at target, below 1 too fast.
 
-    None when the reading cannot be judged: expired, malformed, or too early.
+    The worse of two views: average burn so far (catches a fast start) and the
+    budget left over the time left (catches a late squeeze). None when the
+    reading cannot be judged: expired, malformed, or too early in the window.
     """
     left = (resets - now) / length
-    if not 0 < left <= 1 - AUTO_WARMUP:
+    if not 0 < left <= 1 - AUTO_WARMUP / length:
         return None
-    return max(0.0, target - percent) / target / left
+    remaining = max(0.0, target - percent) / target / left
+    average = (1 - left) * target / percent if percent > 0 else float('inf')
+    return min(remaining, average)
 
 
-def auto_limit(current, cap, paces, now, changed):
-    """One step toward pace at most every AUTO_STEP; the fixed limit without data."""
-    if not paces:
+def auto_limit(current, cap, signals, now, changed, ceiling=None):
+    """One slot at most every AUTO_STEP; the normal limit `cap` without data.
+
+    signals: (kind, pace) of each judgeable window. Any window below its `low`
+    lowers the limit, down to the smallest floor among those windows; up to
+    `cap` it rises when every window is above its `high`. Between `cap` and
+    `ceiling` every window must be above AUTO_BOOST[1], and the limit returns
+    toward `cap` once any falls under AUTO_BOOST[0].
+    """
+    ceiling = max(cap, ceiling or cap)
+    if not signals:
         return cap, changed
-    current = max(1, min(current, cap))
+    current = max(1, min(current, ceiling))
     if now - changed < AUTO_STEP:
         return current, changed
-    worst = min(paces)
-    if worst < AUTO_BAND[0] and current > 1:
+    down = [AUTO_POLICY[k]['floor'] for k, p in signals if p < AUTO_POLICY[k]['low']]
+    if down:
+        if current > min(min(down), cap):
+            return current - 1, now
+        return current, changed
+    paces = [p for _, p in signals]
+    if current > cap and min(paces) < AUTO_BOOST[0]:
         return current - 1, now
-    if worst > AUTO_BAND[1] and current < cap:
+    if current < cap and all(p > AUTO_POLICY[k]['high'] for k, p in signals):
+        return current + 1, now
+    if cap <= current < ceiling and min(paces) > AUTO_BOOST[1]:
         return current + 1, now
     return current, changed
 
@@ -147,11 +170,14 @@ def claude_owner():
 
 class Queue:
     def __init__(self, db, agents=DEFAULT_AGENTS, identity=process_identity, lease=LEASE,
-                 auto=False, clock=time.time):
+                 auto=False, clock=time.time, ceiling=None):
         if any(type(n) is not int or n < 1 for n in (agents, lease)):
             raise ValueError('Limits must be positive integers')
         self.identity = identity
         self.cap = agents
+        if ceiling is not None and (type(ceiling) is not int or ceiling < agents):
+            raise ValueError('The maximum must be an integer at least the agent limit')
+        self.ceiling = ceiling or agents
         self.limits = {'agent': agents}
         self.auto = bool(auto)
         self.clock = clock
@@ -189,9 +215,12 @@ class Queue:
                 if alive != owner['birth']:
                     self.db.execute('DELETE FROM tickets WHERE pid=? AND birth=?', tuple(owner))
             now = time.time()
-            # A live owner can still lose track of a ticket (failed release, reloaded mod).
-            self.db.execute(f"""UPDATE tickets SET state='released', touched=? WHERE {LIVE}
-                AND instance!='' AND coalesce(touched,created)<?""", (now, now - self.lease))
+            paused = self.db.execute("SELECT value FROM control WHERE name='effective'").fetchone()
+            if not (paused and paused[0] == 0):
+                # A live owner can still lose track of a ticket (failed release, reloaded mod).
+                # During a pause every ticket waits on purpose: none expires.
+                self.db.execute(f"""UPDATE tickets SET state='released', touched=? WHERE {LIVE}
+                    AND instance!='' AND coalesce(touched,created)<?""", (now, now - self.lease))
             self.db.execute("DELETE FROM tickets WHERE state='released' AND coalesce(touched,created)<?",
                             (now - TOMBSTONE,))
             self._promote()
@@ -210,7 +239,7 @@ class Queue:
         if self.auto:
             now = self.clock()
             windows = [w for w in self.windows() if w['resets'] > now]
-            paces = [w['pace'] for w in windows if w['pace'] is not None]
+            signals = [(w['kind'], w['pace']) for w in windows if w['pace'] is not None]
             previous = int(value.get('limit', self.cap))
             spent = [w['resets'] for w in windows if w['percent'] >= AUTO_TARGET]
             if spent:
@@ -220,12 +249,12 @@ class Queue:
             else:
                 if previous == 0:
                     previous = self.cap  # A renewed window starts again from the maximum.
-                limit, changed = auto_limit(previous, self.cap, paces, now, value.get('changed', 0))
+                limit, changed = auto_limit(previous, self.cap, signals, now, value.get('changed', 0), self.ceiling)
             if limit != previous:
                 try:
                     with self.log.open('a') as f:
-                        f.write(json.dumps({'at': now, 'from': previous, 'to': limit, 'cap': self.cap,
-                                            'paces': [round(p, 2) for p in paces]}) + '\n')
+                        f.write(json.dumps({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
+                                            'paces': {k: round(p, 2) for k, p in signals}}) + '\n')
                 except OSError:
                     pass  # The log is a convenience; admission must not depend on it.
             self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
@@ -273,7 +302,7 @@ class Queue:
             with self.db:
                 self._control()
             return {'limits': self.limits, 'lease': self.lease,
-                    'auto': {'enabled': self.auto, 'cap': self.cap, 'target': AUTO_TARGET, 'until': self.until,
+                    'auto': {'enabled': self.auto, 'cap': self.cap, 'max': self.ceiling, 'target': AUTO_TARGET, 'until': self.until,
                              'windows': self.windows()} if self.auto else {'enabled': False},
                     'tickets': [
                 {**dict(r), 'idle': round(now - r['seen'])} for r in self.db.execute(
@@ -389,7 +418,7 @@ def local_call(home, data):
             if result is None:
                 config = json.loads((home/'config.json').read_text())
                 q = Queue(home/'queue.sqlite3', config['agents'], lease=config.get('lease', LEASE),
-                          auto=config.get('auto', True))
+                          auto=config.get('auto', True), ceiling=config.get('max'))
                 try:
                     q.reap()
                     result = q.operate(data)
@@ -401,7 +430,7 @@ def local_call(home, data):
         time.sleep(min(2 if result.get('paused_until') else 0.25, max(0, deadline-time.monotonic())))
 
 
-def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None):
+def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=None):
     """Create or (replace=True) update the configuration; None keeps a configured value."""
     if agents is not None and (type(agents) is not int or agents < 1):
         raise ValueError('Agent limit must be a positive integer')
@@ -436,9 +465,16 @@ def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None):
                 agents = old['agents'] if old and 'agents' in old else DEFAULT_AGENTS
             if auto is None:
                 auto = (old or {}).get('auto', True)
+            if ceiling is None:
+                ceiling = (old or {}).get('max')
+            if ceiling is not None and ceiling < agents:
+                ceiling = agents  # The maximum is never below the normal limit.
+            new = {'agents': agents, 'auto': bool(auto), 'schema': 2}
+            if ceiling is not None and ceiling > agents:
+                new['max'] = ceiling
             temporary = home/'config.json.tmp'
             with temporary.open('w') as f:
-                json.dump({'agents': agents, 'auto': bool(auto), 'schema': 2}, f)
+                json.dump(new, f)
                 f.flush()
                 os.fsync(f.fileno())
             temporary.replace(config)
@@ -454,6 +490,7 @@ def main():
     c = sub.add_parser('configure')
     c.add_argument('--agents', type=int, help='Maximum working agents; the automatic limit never exceeds it')
     c.add_argument('--auto', choices=('on', 'off'), help='Lower the limit while usage runs ahead of its window')
+    c.add_argument('--max', type=int, help='With --auto on, go up to this many agents while every window has plenty left')
     sub.add_parser('status')
     e = sub.add_parser('evict', help='Release tickets by number, as listed by status or /slots')
     e.add_argument('seqs', type=int, nargs='+')
@@ -463,10 +500,12 @@ def main():
     if args.command == 'init':
         print(json.dumps(initialize(args.home, args.agents), indent=2))
     elif args.command == 'configure':
-        if args.agents is None and args.auto is None:
-            p.error('configure needs --agents and/or --auto')
+        if args.agents is None and args.auto is None and args.max is None:
+            p.error('configure needs --agents, --auto and/or --max')
+        if args.max is not None and args.max < 1:
+            p.error('--max must be a positive integer')
         auto = None if args.auto is None else args.auto == 'on'
-        print(json.dumps(initialize(args.home, args.agents, replace=True, auto=auto), indent=2))
+        print(json.dumps(initialize(args.home, args.agents, replace=True, auto=auto, ceiling=args.max), indent=2))
     elif args.command == 'status':
         print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
     elif args.command == 'evict':

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1-beta.1
+
+- `configure --max N`: with plenty left in every window (pace above 1.25, weekly included), the limit may rise above the normal `--agents` value up to N, one slot per 10 minutes, and returns toward normal once any window falls under 1.1. Off by default.
+- A subagent paused past Claude Code's 10-minute step bound ends with a message telling its parent to dispatch it again after the renewal, instead of an empty answer.
+- Pace now also judges the average burn so far: a fast start (14% used after 10% of the 5-hour window) lowers the limit at once. 0.5.0 only compared the budget left with the time left, which tolerated a fast start until late in the window.
+- The weekly window is tolerant: it lowers the limit only at twice the sustainable pace, never below 2 agents.
+- The first 15 minutes of a window (not 5% of it, which was 8 hours for the weekly window) are ignored.
+- Pauses: lease expiry and idle release are suspended while every agent waits on purpose.
+- The engine abandons a subagent's model step after 10 minutes. The mod no longer aborts a turn whose dispatch was abandoned, and a failed `$.turn.abort` (refused for subagent turns) can no longer let the model run without a slot.
+
 ## 0.5.0-beta.1
 
 - Automatic limit (on by default): `--agents` becomes the maximum. Using the usage windows Claude Code reports (5-hour and weekly), the limit drops a slot while usage runs ahead of the window's elapsed time and rises while it runs behind, at most one slot per 10 minutes, aiming to end each window at 95%.

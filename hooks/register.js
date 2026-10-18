@@ -15,12 +15,13 @@ async function call($, data) {
   return result;
 }
 // Resolves true when granted, false when the ticket was released (canceled, evicted, expired).
-async function acquire($, ticket, signal) {
+async function acquire($, ticket, signal, registry) {
   let first=true, paused=false;
   for (;;) {
     signal.throwIfAborted();
     const r=await call($,{...ticket,op:'acquire',wait:first?0:15});
     first=false;
+    if(r.paused_until) registry.pausedUntil=r.paused_until*1000;
     signal.throwIfAborted();
     if(r.state==='granted') {if(paused) $.ui.status(undefined); return true;}
     if(r.state!=='queued') return false;
@@ -59,7 +60,7 @@ async function enter($,state,signal) {
       }
       let granted;
       state.acquiring=true;
-      try {granted=await acquire($,state.ticket,signal);}
+      try {granted=await acquire($,state.ticket,signal,state.registry);}
       catch(error) {await release($,state); throw error;}
       finally {state.acquiring=false;}
       if(granted) break;
@@ -115,11 +116,12 @@ async function report($,registry,limits) {
   await call($,{op:'usage',readings});
   registry.reported=signature;
 }
-async function heartbeat($,{held,orphans}) {
+async function heartbeat($,{held,orphans,pausedUntil}) {
   const now=Date.now(), keys=[];
+  const paused=now<(pausedUntil||0)+HEARTBEAT_MS;  // Agents wait on purpose during a pause.
   for(const state of held) {
     if(!state.ticket) {held.delete(state); continue;}
-    if(state.busy===0 && state.waiting===0 && !state.acquiring && now-state.active>IDLE_MS) {
+    if(!paused && state.busy===0 && state.waiting===0 && !state.acquiring && now-state.active>IDLE_MS) {
       // A turn whose end was never heard must not keep its slot.
       await locked(state,async()=>{
         if(state.busy===0 && !state.acquiring && Date.now()-state.active>IDLE_MS) await release($,state);
@@ -170,7 +172,7 @@ export function register(on) {
       const lines=s.tickets.map(t=>`#${t.seq} ${t.state} session ${t.session.slice(0,8)} pid ${t.pid}, renewed ${t.idle}s ago`);
       const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
         [`Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "python3 guard.py configure --auto off" resumes now.`] : [];
-      const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} of max ${s.auto.cap}, pacing to ${s.auto.target}% per window`+
+      const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
         (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
       return {text:[`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot.`,...auto,...lines].join('\n')};
     } catch(error) {return {text:'Slot Guard: '+String(error)};}
@@ -194,8 +196,21 @@ export function register(on) {
       await enter($,state,next.signal); entered=true;
       return yield* next(e);
     } catch(error) {
+      // An abandoned dispatch (interrupt, reload) has already moved on: do not stop the turn again.
+      if(next.signal.aborted) {
+        // The engine gives up on a subagent's step after 10 minutes: tell its parent to retry.
+        if(e.agentId && Date.now()<(registry.pausedUntil||0)) {
+          const text=`Slot Guard paused this subagent: a usage window is near its limit. It did no work. `+
+            `Dispatch it again after ${new Date(registry.pausedUntil).toLocaleTimeString()}, when the window renews.`;
+          yield {kind:'text',index:0,text};
+          yield {kind:'stop',stopReason:'end_turn',usage:null};
+          return {...emptyStep(e),answer:text,stopReason:'end_turn'};
+        }
+        return emptyStep(e);
+      }
       $.ui.status('Slot Guard: turn stopped — '+String(error));
-      await $.turn.abort({turnId:e.turnId});
+      // $.turn.abort refuses a subagent's turn; failing here would let the model run unadmitted.
+      try {await $.turn.abort({turnId:e.turnId});} catch {}
       return emptyStep(e);
     } finally {
       if(entered) await leave($,state);
