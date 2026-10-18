@@ -10,12 +10,22 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.test_environment import test_environment
-from guard import initialize, local_call
+from guard import process_identity, initialize, local_call
 from statusline import badge
 from statusline_setup import setup
 
 
 class PackagingTests(unittest.TestCase):
+    def test_badge_shows_machine_wide_waiting_and_session_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)/'state'
+            initialize(home, 1)
+            owner = {'pid':os.getpid(), 'birth':process_identity(os.getpid())}
+            for key, session in (('a','s1'), ('b','s2'), ('c','s1')):
+                local_call(home, {'op':'acquire','key':key,'pool':'agent','session':session,'turn':key,**owner})
+            self.assertEqual(badge(home,'s1'), 'Agents ■ 1/1 · 2 waiting · ⌛ #2')
+            self.assertEqual(badge(home,'s3'), 'Agents ■ 1/1 · 2 waiting')
+
     def test_parallel_first_install_preserves_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)/'state'

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {register} from '../hooks/register.js';
 
 function harness(respond=async()=>({state:'granted'})) {
-  const handlers={}, fallbacks={},calls=[],aborts=[],timers=[];
+  const handlers={}, fallbacks={},calls=[],aborts=[],timers=[],afters=[];
   register((event,matcher,handler)=>{handlers[event]=handler||matcher;return {catch(fn){fallbacks[event]=fn;}};});
   const $={plugin:{root:'/plugin'},session:{id:async()=> 'session'},
     process:{run:async(argv,opts)=>{
@@ -11,8 +11,9 @@ function harness(respond=async()=>({state:'granted'})) {
       const data=JSON.parse(opts.stdin);calls.push(data);
       return {exitCode:0,stdout:JSON.stringify(await respond(data)),stderr:''};
     }},ui:{status(){}},turn:{abort:async e=>{aborts.push(e.turnId);}},
-    command:{register:async()=>{}},env:{get:async()=>undefined},clock:{every:(ms,fn)=>{timers.push(fn);return {cancel(){}};}}};
-  return {handlers,fallbacks,calls,aborts,timers,$};
+    command:{register:async()=>{}},env:{get:async()=>undefined},clock:{every:(ms,fn)=>{timers.push(fn);return {cancel(){}};},
+      after:(ms,fn)=>{const t={ms,fn,cancelled:false,cancel(){t.cancelled=true;}};afters.push(t);return t;}}};
+  return {handlers,fallbacks,calls,aborts,timers,afters,$};
 }
 const event={turnId:'turn',index:0};
 function next(fn=async()=>({})) {fn.signal=new AbortController().signal;return fn;}
@@ -184,11 +185,14 @@ test('permission ask yields the slot while the person decides',async()=>{
   const tool=h.handlers['tool.call'](h.$,{tool:'Bash',command:'rm x',tool_use_id:'u1'},next(async()=>{
     const verdict=await h.handlers['tool.check'](h.$,{tool:'Bash',tool_use_id:'u1'},async()=>({decision:'ask'}));
     assert.equal(verdict.decision,'ask');
+    await tick();assert.equal(h.calls.filter(c=>c.op==='release').length,0);
+    assert.equal(h.afters[0].ms,15000);h.afters[0].fn();
     await tick();await tick();
     assert.equal(h.calls.at(-1).op,'release');
     await new Promise(r=>{decide=r;});return {};
   }));
-  await tick();await tick();await tick();decide();await tool;
+  while(!decide) await tick();
+  decide();await tool;
   assert.equal(h.calls.filter(c=>c.op==='release').length,1);
   const before=h.calls.length;await step(h,{...event,index:1});
   assert.equal(h.calls[before].op,'acquire');
@@ -223,4 +227,14 @@ test('slots command evicts by ticket number',async()=>{
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:'evict #12 13'});
   assert.deepEqual(h.calls.at(-1),{op:'evict',seqs:[12,13]});assert.match(r.text,/2 ticket/);
   assert.match((await h.handlers['command.run'](h.$,{command:'slots',args:'evict x'})).text,/Usage/);
+});
+test('an ask answered quickly (auto mode classifier) keeps the slot',async()=>{
+  const h=harness();await step(h);
+  await h.handlers['tool.call'](h.$,{tool:'Bash',command:'ls',tool_use_id:'u3'},next(async()=>
+    h.handlers['tool.check'](h.$,{tool:'Bash',tool_use_id:'u3'},async()=>({decision:'ask'}))));
+  assert.equal(h.afters.length,1);assert.ok(h.afters[0].cancelled);
+  h.afters[0].fn();await tick();await tick();
+  assert.equal(h.calls.filter(c=>c.op==='release').length,0);
+  await step(h,{...event,index:1});
+  assert.equal(new Set(h.calls.filter(c=>c.op==='acquire').map(c=>c.key)).size,1);
 });

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1-beta.1
+
+- Fix slot churn in auto mode: 0.4.0 yielded the slot on every permission `ask`, and auto mode asks its classifier on most tool calls, so agents released and requeued at the back of FIFO every few seconds. A slot is now yielded only when an ask is still open after 15 seconds.
+- The statusline shows the machine-wide queue: `Agents ■■■■ 4/4 · 2 waiting · ⌛ #1`.
+
 ## 0.4.0-beta.1
 
 - Slots can no longer be held forever by a living Claude process:

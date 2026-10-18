@@ -1,6 +1,7 @@
 // One slot per working agent, held across model steps and ordinary tools.
 const HEARTBEAT_MS=30000;  // Renews held tickets; the coordinator's lease is 300 s.
 const IDLE_MS=120000;      // A ticket nobody is using this long is released.
+const ASK_GRACE_MS=15000;  // An ask still open this long waits for the person, not auto mode's classifier.
 const FORGET_MS=600000;    // Unused agent states are dropped after this.
 const instance=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10);
 const emptyStep = e => ({turnId:e.turnId,index:e.index,answer:'',toolUses:[],stopReason:null,usage:null});
@@ -194,6 +195,7 @@ export function register(on) {
     try {return await next(e);}
     finally {
       if(e.tool_use_id) pending.delete(e.tool_use_id);
+      if(admitted.timer) admitted.timer.cancel();
       await locked(state,async()=>{
         admitted.done=true;
         if(admitted.suspended) {state.waiting--; state.active=Date.now(); return;}
@@ -202,17 +204,19 @@ export function register(on) {
       });
     }
   }).catch(($,e,next)=>next.called ? next(e) : {deny:'Slot Guard: could not admit tool execution'});
-  // A permission ask waits for the person: yield the slot until the agent works again.
+  // A permission ask that stays open waits for the person: yield the slot until the agent
+  // works again. Auto mode asks its classifier on most calls and answers within seconds.
   on('tool.check',async($,e,next)=>{
     const verdict=await next(e);
     const admitted=e.tool_use_id && pending.get(e.tool_use_id);
-    if(admitted && verdict.decision==='ask') {
+    if(admitted && verdict.decision==='ask' && !admitted.timer) {
       const state=admitted.state;
-      // The agent holds a granted ticket here, so its lock is only held briefly.
-      await locked(state,async()=>{
-        if(admitted.done || admitted.suspended) return;
-        admitted.suspended=true; state.busy--; state.waiting++;
-        if(state.busy===0) await release($,state);
+      admitted.timer=$.clock.after(ASK_GRACE_MS,()=>{
+        locked(state,async()=>{
+          if(admitted.done || admitted.suspended) return;
+          admitted.suspended=true; state.busy--; state.waiting++;
+          if(state.busy===0) await release($,state);
+        }).catch(()=>{});
       });
     }
     return verdict;

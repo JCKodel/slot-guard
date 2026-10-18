@@ -23,6 +23,7 @@ def badge(home, session):
         limits = json.loads((home / 'config.json').read_text())
         with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True, timeout=.1)) as conn:
             used = dict(conn.execute("SELECT pool,count(*) FROM tickets WHERE state='granted' GROUP BY pool"))
+            queued = dict(conn.execute("SELECT pool,count(*) FROM tickets WHERE state='queued' GROUP BY pool"))
             rows = conn.execute("""SELECT t.pool,
                 (SELECT count(*) FROM tickets q
                  WHERE q.pool=t.pool AND q.state='queued' AND q.seq<=t.seq)
@@ -33,6 +34,8 @@ def badge(home, session):
         for pool, position in rows:
             positions.setdefault(pool, position)
         summary = slot_bar('Agents', used.get('agent', 0), limits['agents'])
+        if queued.get('agent'):
+            summary += f" · {queued['agent']} waiting"  # Machine-wide, all sessions.
         waiting = ' · '.join('⌛ #' + str(n) for p,n in positions.items() if p == 'agent')
         return summary + (' · ' + waiting if waiting else '')
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):

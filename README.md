@@ -3,7 +3,7 @@
 Machine-wide FIFO concurrency slots for **Claude Code**. Limit the total number of working main agents and subagents across terminals, including time spent executing tools.
 
 ```text
-Agents ■■■■ 4/4 · ⌛ #1
+Agents ■■■■ 4/4 · 2 waiting · ⌛ #1
 ```
 
 **Beta · macOS · native Claude Code 2.1.302+ · Python 3.10+ · AGPL-3.0-only**
@@ -45,7 +45,7 @@ python3 guard.py evict 12      # free ticket #12 by hand
 
 `--agents` is the single global limit. Four sessions without children, two working parents plus two working children, or one working parent plus three children all use four slots. Idle terminals and parents suspended waiting only for children do not count as working.
 
-A slot spans inference and ordinary tools, not merely an API response. An agent yields its slot while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt, and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
+A slot spans inference and ordinary tools, not merely an API response. An agent yields its slot while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt still open after 15 seconds (auto mode's classifier answers sooner and keeps the slot), and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
 
 ### Upgrading from 0.2.x or the private prototype
 
@@ -68,7 +68,7 @@ This explicitly updates your Claude `settings.json`, saves the previous statusli
 Agents ■■■□ 3/4 · ⌛ #2
 ```
 
-`■` is occupied; `□` is available. The single count includes all working main agents and subagents. Queue positions are specific to the current session. The display is read-only and refreshes every five seconds. It does not split or reformat your existing bars. Slow existing commands have a three-second timeout.
+`■` is occupied; `□` is available. The single count includes all working main agents and subagents. `N waiting` counts queued agents on the whole machine; `⌛ #n` is the current session's best queue position. The display is read-only and refreshes every five seconds. It does not split or reformat your existing bars. Slow existing commands have a three-second timeout.
 
 Restore the previous statusline:
 
