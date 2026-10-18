@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2-beta.1
+
+- New installations default to 3 working-agent slots instead of 4. Existing configurations keep their limit.
+- README: "Choosing a limit" by Claude plan, with the measured Max 5x value and a calibration procedure.
+
 ## 0.4.1-beta.1
 
 - Fix slot churn in auto mode: 0.4.0 yielded the slot on every permission `ask`, and auto mode asks its classifier on most tool calls, so agents released and requeued at the back of FIFO every few seconds. A slot is now yielded only when an ask is still open after 15 seconds.

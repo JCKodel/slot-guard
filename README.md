@@ -3,12 +3,12 @@
 Machine-wide FIFO concurrency slots for **Claude Code**. Limit the total number of working main agents and subagents across terminals, including time spent executing tools.
 
 ```text
-Agents ■■■■ 4/4 · 2 waiting · ⌛ #1
+Agents ■■■ 3/3 · 2 waiting · ⌛ #1
 ```
 
 **Beta · macOS · native Claude Code 2.1.302+ · Python 3.10+ · AGPL-3.0-only**
 
-Four agents can work while a fifth waits locally. Main agents and subagents share one pool. An agent holds its slot across model steps and ordinary tools, until its turn finishes. A parent waiting only for children yields its slot and reacquires before doing more work. No queue server, daemon, npm dependencies, telemetry, or model calls to manage the queue.
+By default three agents can work while a fourth waits locally. Main agents and subagents share one pool. An agent holds its slot across model steps and ordinary tools, until its turn finishes. A parent waiting only for children yields its slot and reacquires before doing more work. No queue server, daemon, npm dependencies, telemetry, or model calls to manage the queue.
 
 ## Install
 
@@ -18,7 +18,7 @@ Make sure `python3` is on the PATH used by Claude Code. From your terminal:
 claude plugin install slot-guard --marketplace JCKodel/slot-guard
 ```
 
-Restart all Claude Code sessions that should participate. The first use creates private state in `~/.local/state/slot-guard` with **4 working-agent slots**. Run `/slots` in Claude Code to inspect occupancy and the queue. This is a local command, not a prompt sent to a model.
+Restart all Claude Code sessions that should participate. The first use creates private state in `~/.local/state/slot-guard` with **3 working-agent slots**. See [Choosing a limit](#choosing-a-limit) for your plan. Run `/slots` in Claude Code to inspect occupancy and the queue. This is a local command, not a prompt sent to a model.
 
 Do not enable two copies of Slot Guard in one session. If you used the earlier private prototype, disable it before enabling this version. The public version intentionally uses a different state directory; the two versions do not coordinate with each other by default.
 
@@ -38,12 +38,25 @@ For configuration and optional statusline installation, keep a checkout:
 ```sh
 git clone https://github.com/JCKodel/slot-guard.git
 cd slot-guard
-python3 guard.py configure --agents 4
+python3 guard.py configure --agents 3
 python3 guard.py status
 python3 guard.py evict 12      # free ticket #12 by hand
 ```
 
-`--agents` is the single global limit. Four sessions without children, two working parents plus two working children, or one working parent plus three children all use four slots. Idle terminals and parents suspended waiting only for children do not count as working.
+`--agents` is the single global limit. Three sessions without children, two working parents plus one working child, or one working parent plus two children all use three slots. Idle terminals and parents suspended waiting only for children do not count as working. A new limit applies at once to every session; work already running finishes, and the queue drains to the new limit.
+
+### Choosing a limit
+
+The right limit depends on your Claude plan: the goal is for the 5-hour usage window to last its full five hours. Slot Guard limits concurrency, not tokens, so the limit sets how fast the window drains.
+
+| Plan | Limit | Source |
+|---|---:|---|
+| Claude Max 5x | 3 | Measured by the maintainer: 4 drained the 5-hour window early, 3 lasts it. |
+| Other plans | not measured yet | Start at 3 and calibrate. |
+
+To calibrate, work normally and watch the 5-hour usage meter (`/usage`, or your statusline). If the window runs out before five hours, lower the limit by one; if a lot remains when it resets, raise it by one. Your usage pattern (model, effort, context size) matters as much as the plan. Measurements for other plans are welcome as issues or pull requests.
+
+The default for new installations is 3. Upgrading keeps your configured limit.
 
 A slot spans inference and ordinary tools, not merely an API response. An agent yields its slot while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt still open after 15 seconds (auto mode's classifier answers sooner and keeps the slot), and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
 

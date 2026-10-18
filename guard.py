@@ -20,6 +20,7 @@ import time
 
 DEFAULT_HOME = Path.home() / '.local/state/slot-guard'
 MAX_MESSAGE = 16384
+DEFAULT_AGENTS = 3  # Lasts a 5-hour window on Claude Max 5x; see README.
 LEASE = 300  # Seconds without renewal before a heartbeating ticket is abandoned.
 TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
 LIVE = "state IN ('queued','granted')"
@@ -112,7 +113,7 @@ def claude_owner():
 
 
 class Queue:
-    def __init__(self, db, agents=4, identity=process_identity, lease=LEASE):
+    def __init__(self, db, agents=DEFAULT_AGENTS, identity=process_identity, lease=LEASE):
         if any(type(n) is not int or n < 1 for n in (agents, lease)):
             raise ValueError('Limits must be positive integers')
         self.identity = identity
@@ -287,7 +288,7 @@ def local_call(home, data):
         time.sleep(min(0.25, max(0, deadline-time.monotonic())))
 
 
-def initialize(home, agents=4, replace=False):
+def initialize(home, agents=DEFAULT_AGENTS, replace=False):
     if type(agents) is not int or agents < 1:
         raise ValueError('Agent limit must be a positive integer')
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -331,7 +332,7 @@ def main():
     p.add_argument('--home', type=Path, default=Path(os.environ.get('CLAUDE_SLOT_HOME', DEFAULT_HOME)))
     sub = p.add_subparsers(dest='command', required=True)
     s = sub.add_parser('init')
-    s.add_argument('--agents', type=int, default=4)
+    s.add_argument('--agents', type=int, default=DEFAULT_AGENTS)
     c = sub.add_parser('configure')
     c.add_argument('--agents', type=int, required=True)
     sub.add_parser('status')
