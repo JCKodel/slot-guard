@@ -1,6 +1,6 @@
 {
   "name": "slot-guard",
-  "version": "0.5.3-beta.1",
+  "version": "0.6.0-beta.1",
   "description": "One machine-wide FIFO limit for working Claude Code agents, including subagents and tool execution.",
   "author": {
     "name": "J.C.K\u00f6del",

@@ -22,6 +22,7 @@ DEFAULT_HOME = Path.home() / '.local/state/slot-guard'
 MAX_MESSAGE = 16384
 DEFAULT_AGENTS = 3  # Lasts a 5-hour window on Claude Max 5x; see README.
 LEASE = 300  # Seconds without renewal before a heartbeating ticket is abandoned.
+QUANTUM = 60  # Seconds an agent keeps its slot before yielding it to one that waits.
 TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
 LIVE = "state IN ('queued','granted')"
 # Automatic limit: keep each usage window on pace to end at AUTO_TARGET percent,
@@ -200,8 +201,8 @@ def claude_owner():
 
 class Queue:
     def __init__(self, db, agents=DEFAULT_AGENTS, identity=process_identity, lease=LEASE,
-                 auto=False, clock=time.time, ceiling=None):
-        if any(type(n) is not int or n < 1 for n in (agents, lease)):
+                 auto=False, clock=time.time, ceiling=None, quantum=QUANTUM):
+        if any(type(n) is not int or n < 1 for n in (agents, lease, quantum)):
             raise ValueError('Limits must be positive integers')
         self.identity = identity
         self.cap = agents
@@ -213,6 +214,7 @@ class Queue:
         self.clock = clock
         self.log = Path(db).parent / 'auto.log'
         self.lease = lease
+        self.quantum = quantum
         self.lock = threading.RLock()  # One connection, shared by threads in tests and tools.
         self.db = sqlite3.connect(db, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -237,6 +239,10 @@ class Queue:
         if 'rank' not in columns:
             # 0: work already under way (subagents, resumptions) goes before new prompts (1).
             self.db.execute('ALTER TABLE tickets ADD COLUMN rank INTEGER NOT NULL DEFAULT 1')
+        if 'since' not in columns:
+            # When the slot was granted, and the queue position after a rotation (else seq).
+            self.db.execute('ALTER TABLE tickets ADD COLUMN since REAL')
+            self.db.execute('ALTER TABLE tickets ADD COLUMN pos INTEGER')
         self.db.commit()
 
     def reap(self):
@@ -317,8 +323,26 @@ class Queue:
                 self.db.execute("UPDATE tickets SET state='queued' WHERE pool=? AND state='granted'", (pool,))
             used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (pool,)).fetchone()[0]
             free = max(0, limit - used)
-            self.db.execute("""UPDATE tickets SET state='granted' WHERE seq IN
-                (SELECT seq FROM tickets WHERE pool=? AND state='queued' ORDER BY rank, seq LIMIT ?)""", (pool, free))
+            self.db.execute("""UPDATE tickets SET state='granted', since=? WHERE seq IN
+                (SELECT seq FROM tickets WHERE pool=? AND state='queued' ORDER BY rank, coalesce(pos, seq) LIMIT ?)""",
+                (time.time(), pool, free))
+
+    def _rotate(self, key, now):
+        """Cooperative multitasking: a slot held for a quantum goes to the next in line.
+
+        The agent keeps its ticket, queued behind every agent waiting now (rank 1: an
+        agent's first grant of a turn still goes first). Nothing happens when no one waits.
+        The caller must only rotate an agent between model calls.
+        """
+        row = self.db.execute('SELECT seq,pool,since FROM tickets WHERE key=? AND state=?', (key, 'granted')).fetchone()
+        if not row or row['since'] is None or now - row['since'] < self.quantum:
+            return False
+        if not self.db.execute("SELECT 1 FROM tickets WHERE pool=? AND state='queued' AND key!=?",
+                               (row['pool'], key)).fetchone():
+            return False
+        last = self.db.execute('SELECT max(coalesce(pos, seq)) FROM tickets').fetchone()[0]
+        self.db.execute("UPDATE tickets SET state='queued', rank=1, pos=?, since=NULL WHERE key=?", (last + 1, key))
+        return True
 
     @staticmethod
     def validate_owner(data):
@@ -354,7 +378,7 @@ class Queue:
                     'tickets': [
                 {**dict(r), 'idle': round(now - r['seen'])} for r in self.db.execute(
                     f"""SELECT seq,pool,session,turn,pid,state,coalesce(touched,created) AS seen
-                    FROM tickets WHERE {LIVE} ORDER BY rank, seq""")]}
+                    FROM tickets WHERE {LIVE} ORDER BY rank, coalesce(pos, seq)""")]}
         if op == 'evict':
             seqs = data.get('seqs')
             if not isinstance(seqs, list) or not 0 < len(seqs) <= 64 or any(type(n) is not int for n in seqs):
@@ -392,6 +416,19 @@ class Queue:
                 self.db.execute('DELETE FROM usage_log WHERE at<?', (self.clock() - 2 * 86400,))
                 self._promote()
             return {'limit': self.limits['agent']}
+        if op == 'rotate':
+            # Agents between model calls (running tools) offer their slot to those waiting.
+            self.validate_owner(data)
+            keys = data.get('keys')
+            if not isinstance(keys, list) or len(keys) > 256 or any(
+                    not isinstance(k, str) or not 0 < len(k) <= 512 for k in keys):
+                raise ValueError('Invalid keys')
+            now = time.time()
+            with self.db:
+                rotated = [k for k in keys if self.db.execute('SELECT 1 FROM tickets WHERE key=? AND pid=? AND birth=?',
+                           (k, data['pid'], data['birth'])).fetchone() and self._rotate(k, now)]
+                self._promote()
+            return {'rotated': rotated}
         if op == 'touch':
             self.validate_owner(data)
             keys = data.get('keys')
@@ -434,10 +471,15 @@ class Queue:
                     raise ValueError('Owner is not alive')
                 self.db.execute(insert, (*values, 'queued', now, now, data.get('instance', ''), rank))
                 self.db.execute(f'UPDATE tickets SET touched=? WHERE key=? AND {LIVE}', (now, data['key']))
+                if data.get('fresh') is True:
+                    # A subagent taking its parent's slot starts a quantum of its own.
+                    self.db.execute("UPDATE tickets SET since=? WHERE key=? AND state='granted'", (now, data['key']))
+                if data.get('rotate') is True:
+                    self._rotate(data['key'], now)
                 if data.get('force') is True:
                     self._control()
                     if self.limits['agent'] > 0 and self.db.execute(
-                            "UPDATE tickets SET state='granted' WHERE key=? AND state='queued'", (data['key'],)).rowcount:
+                            "UPDATE tickets SET state='granted', since=? WHERE key=? AND state='queued'", (now, data['key'])).rowcount:
                         # Claude Code abandons a subagent's step after 600 s without progress:
                         # admit it over the limit rather than fail it. Nothing new starts until it drains.
                         self.note({'at': now, 'overdraft': data['key'], 'limit': self.limits['agent']})
@@ -448,9 +490,11 @@ class Queue:
             self._promote()
         if op != 'acquire':
             return {'state': 'released'}
-        row = self.db.execute('SELECT seq,state FROM tickets WHERE key=?', (data['key'],)).fetchone()
+        row = self.db.execute('SELECT seq,state,rank,coalesce(pos, seq) AS place FROM tickets WHERE key=?',
+                              (data['key'],)).fetchone()
         position = self.db.execute("""SELECT count(*) FROM tickets WHERE pool=? AND state='queued'
-            AND (rank<? OR (rank=? AND seq<=?))""", (data['pool'], rank, rank, row['seq'])).fetchone()[0]
+            AND (rank<? OR (rank=? AND coalesce(pos, seq)<=?))""",
+            (data['pool'], row['rank'], row['rank'], row['place'])).fetchone()[0]
         result = {'state': row['state'], 'ticket': row['seq'], 'position': position}
         if self.limits['agent'] == 0:
             result['paused_until'] = self.until
@@ -479,7 +523,8 @@ def local_call(home, data):
             if result is None:
                 config = json.loads((home/'config.json').read_text())
                 q = Queue(home/'queue.sqlite3', config['agents'], lease=config.get('lease', LEASE),
-                          auto=config.get('auto', True), ceiling=config.get('max'))
+                          auto=config.get('auto', True), ceiling=config.get('max'),
+                          quantum=config.get('quantum', QUANTUM))
                 try:
                     q.reap()
                     result = q.operate(data)
@@ -491,7 +536,7 @@ def local_call(home, data):
         time.sleep(min(2 if result.get('paused_until') else 0.25, max(0, deadline-time.monotonic())))
 
 
-def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=None):
+def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=None, quantum=None):
     """Create or (replace=True) update the configuration; None keeps a configured value."""
     if agents is not None and (type(agents) is not int or agents < 1):
         raise ValueError('Agent limit must be a positive integer')
@@ -533,6 +578,10 @@ def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=No
             new = {'agents': agents, 'auto': bool(auto), 'schema': 2}
             if ceiling is not None and ceiling > agents:
                 new['max'] = ceiling
+            if quantum is None:
+                quantum = (old or {}).get('quantum')
+            if quantum is not None:
+                new['quantum'] = quantum
             temporary = home/'config.json.tmp'
             with temporary.open('w') as f:
                 json.dump(new, f)
@@ -552,6 +601,7 @@ def main():
     c.add_argument('--agents', type=int, help='Maximum working agents; the automatic limit never exceeds it')
     c.add_argument('--auto', choices=('on', 'off'), help='Lower the limit while usage runs ahead of its window')
     c.add_argument('--max', type=int, help='With --auto on, go up to this many agents while every window has plenty left')
+    c.add_argument('--quantum', type=int, help='Seconds an agent keeps its slot while others wait (default 60)')
     sub.add_parser('status')
     e = sub.add_parser('evict', help='Release tickets by number, as listed by status or /slots')
     e.add_argument('seqs', type=int, nargs='+')
@@ -561,12 +611,15 @@ def main():
     if args.command == 'init':
         print(json.dumps(initialize(args.home, args.agents), indent=2))
     elif args.command == 'configure':
-        if args.agents is None and args.auto is None and args.max is None:
-            p.error('configure needs --agents, --auto and/or --max')
+        if args.agents is None and args.auto is None and args.max is None and args.quantum is None:
+            p.error('configure needs --agents, --auto, --max and/or --quantum')
+        if args.quantum is not None and args.quantum < 1:
+            p.error('--quantum must be a positive integer')
         if args.max is not None and args.max < 1:
             p.error('--max must be a positive integer')
         auto = None if args.auto is None else args.auto == 'on'
-        print(json.dumps(initialize(args.home, args.agents, replace=True, auto=auto, ceiling=args.max), indent=2))
+        print(json.dumps(initialize(args.home, args.agents, replace=True, auto=auto, ceiling=args.max,
+                                    quantum=args.quantum), indent=2))
     elif args.command == 'status':
         print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
     elif args.command == 'evict':

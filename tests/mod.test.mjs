@@ -31,7 +31,7 @@ test('agent retains one slot across model steps and tools until turn ends',async
   await h.handlers['tool.call'](h.$,{tool:'Read',tool_use_id:'r'},next());
   await step(h,{...event,index:1});
   assert.equal(h.calls.filter(c=>c.op==='release').length,0);
-  assert.equal(new Set(h.calls.map(c=>c.key)).size,1);
+  assert.equal(new Set(h.calls.filter(c=>c.key).map(c=>c.key)).size,1);
   await complete(h);assert.equal(h.calls.at(-1).op,'release');
 });
 test('main and subagent acquire the same pool and release independently',async()=>{
@@ -315,14 +315,6 @@ test('nested delegation passes one slot down and back: never more than one held'
   for(const c of h.calls){if(c.op==='acquire')active.add(c.key);else if(c.op==='release')active.delete(c.key);peak=Math.max(peak,active.size);}
   assert.equal(peak,1);assert.equal(active.size,0);
 });
-test('ordinary work resuming while a child is pending takes the parked slot back',async()=>{
-  const h=harness();await step(h);const parentKey=h.calls[0].key;let finish;
-  const child=h.handlers['tool.call'](h.$,{tool:'Agent'},next(()=>new Promise(r=>{finish=r;})));
-  await tick();
-  await h.handlers['tool.call'](h.$,{tool:'Read'},next(async()=>{assert.equal(acquires(h).at(-1).key,parentKey);return {};}));
-  assert.equal(h.calls.filter(c=>c.op==='release').length,0);
-  finish({});await child;
-});
 test('new prompts queue behind work under way',async()=>{
   const h=harness();await step(h);await step(h,{turnId:'c',agentId:'c',index:0});
   assert.deepEqual(acquires(h).map(c=>c.rank),[1,0]);
@@ -342,4 +334,49 @@ test('slots shows the recent rate and any overdraft',async()=>{
     tickets:[{seq:1,state:'granted',session:'s',pid:2,idle:0},{seq:2,state:'granted',session:'s',pid:2,idle:0}]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
   assert.match(r.text,/3.9%\/h lately, pace 4.80/);assert.match(r.text,/1 over the limit/);
+});
+
+const rotates=h=>h.calls.filter(c=>c.op==='rotate');
+test('tools never wait for a slot; between model calls they offer it',async()=>{
+  const h=harness(async d=>d.op==='acquire'?{state:'granted'}:{rotated:[]});await step(h);
+  const k=h.calls[0].key;
+  await h.handlers['tool.call'](h.$,{tool:'Read'},next(async()=>{
+    assert.deepEqual(rotates(h).at(-1).keys,[k]);return {};}));
+  assert.equal(acquires(h).length,1);
+});
+test('no slot is offered while a model call is still streaming',async()=>{
+  const h=harness(async d=>d.op==='acquire'?{state:'granted'}:{rotated:[]});
+  let release;const streaming=new Promise(r=>{release=r;});
+  const g=h.handlers['turn.step'](h.$,event,next(async function*(){await streaming;return {};}));
+  const pending=drain(g);await tick();await tick();
+  await h.handlers['tool.call'](h.$,{tool:'Read'},next(async()=>({})));
+  assert.equal(rotates(h).length,0);
+  release();await pending;
+});
+test('a step after holding the slot asks to rotate; a claimed slot starts fresh',async()=>{
+  const h=harness();await step(h);
+  await step(h,{...event,index:1});
+  assert.equal(acquires(h)[0].rotate,undefined);assert.equal(acquires(h)[1].rotate,true);
+  await h.handlers['tool.call'](h.$,{tool:'Agent'},next(async()=>{
+    await spawn(h,undefined,'kid');await step(h,{turnId:'k',agentId:'kid',index:0});return {};}));
+  assert.equal(acquires(h).at(-1).fresh,true);assert.equal(acquires(h).at(-1).rotate,undefined);
+});
+test('a tool that runs past the heartbeat offers its slot; idle agents do not',async()=>{
+  const h=harness(async d=>d.op==='acquire'?{state:'granted'}:{});await start(h);await step(h);
+  const k=acquires(h)[0].key;
+  let finish;const tool=h.handlers['tool.call'](h.$,{tool:'Bash',command:'make'},next(()=>new Promise(r=>{finish=r;})));
+  await tick();const before=rotates(h).length;
+  await beat(h);assert.deepEqual(rotates(h).at(-1).keys,[k]);assert.equal(rotates(h).length,before+1);
+  finish({});await tool;
+  await beat(h);assert.equal(rotates(h).length,before+1);
+});
+test('a queued (rotated) ticket makes the next model call wait, not the tools',async()=>{
+  let queued=false;
+  const h=harness(async d=>{if(d.op==='rotate'){queued=true;return {rotated:d.keys};}
+    if(d.op==='acquire'&&queued){queued=false;return {state:'queued'};}return {state:'granted'};});
+  await step(h);
+  await h.handlers['tool.call'](h.$,{tool:'Read'},next(async()=>({})));
+  assert.equal(acquires(h).length,1);
+  await step(h,{...event,index:1});
+  assert.equal(acquires(h).length,3);  // queued once, then granted
 });

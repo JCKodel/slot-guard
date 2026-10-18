@@ -8,7 +8,7 @@ Agents ■■■ 3/3 · 2 waiting · ⌛ #1
 
 **Beta · macOS · native Claude Code 2.1.302+ · Python 3.10+ · AGPL-3.0-only**
 
-By default three agents can work while a fourth waits locally. Main agents and subagents share one pool. An agent holds its slot across model steps and ordinary tools, until its turn finishes. A parent waiting only for children yields its slot and reacquires before doing more work. No queue server, daemon, npm dependencies, telemetry, or model calls to manage the queue.
+By default three agents can be in a model call while a fourth waits locally. Main agents and subagents share one pool. Agents take turns: one that has held its slot for a minute hands it to the next in line at its next tool, so a single slot is shared instead of monopolized. A parent waiting only for children yields its slot and reacquires before doing more work. No queue server, daemon, npm dependencies, telemetry, or model calls to manage the queue.
 
 ## Install
 
@@ -73,6 +73,7 @@ The pace aims to finish each window at 95%. The first 15 minutes of a window are
 
 ```sh
 python3 guard.py configure --max 5      # allow up to 5 while there is plenty left
+python3 guard.py configure --quantum 60 # seconds an agent keeps its slot while others wait
 python3 guard.py configure --auto off   # fixed limit
 python3 guard.py configure --auto on
 python3 guard.py status                 # limit, maximum, and each window's usage, elapsed time and pace
@@ -88,7 +89,13 @@ Claude Code fails a subagent whose model step shows no progress for 600 seconds.
 - **Work under way first:** subagents and resumed turns queue ahead of new prompts.
 - **Overdraft:** a subagent that has waited 7 minutes is admitted even over the limit, leaving the model 3 minutes to start answering before the 10-minute stall limit. Nothing new starts until the pool is back under the limit; `/slots` shows `N over the limit` and `auto.log` records each one. A pause at 95% is never overdrawn.
 
-A slot spans inference and ordinary tools, not merely an API response. An agent yields its slot while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt still open after 15 seconds (auto mode's classifier answers sooner and keeps the slot), and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its slot until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
+### Taking turns (cooperative multitasking)
+
+The limit counts agents **in a model call**, which is what spends usage. Tools run on the agent's ticket whether it is granted or waiting, and never wait for a slot. Between model calls (at the start of each tool, and every 30 seconds during a long one) an agent that has held its slot for the quantum (60 seconds by default) hands it to the next in line and queues again. Nothing happens when nobody waits. A model call is never interrupted: rotation only happens between calls, in one coordinator transaction, so no more than the limit are ever in a model call at once. An agent's first grant in a turn still goes before agents that already had theirs.
+
+With `n` agents sharing one slot, each waits about `(n − 1) × quantum` between turns. Up to five agents that stays under the 5-minute prompt-cache lifetime of subagents; with more, a longer quantum avoids cache rebuilds at the cost of longer turns.
+
+An agent yields its slot at once while it waits on something else: `Agent`/legacy `Task` delegation, blocking `TaskOutput`, a question or plan approval for the person (`AskUserQuestion`, `ExitPlanMode`), a permission prompt still open after 15 seconds (auto mode's classifier answers sooner and keeps the slot), and a `Bash` command that runs `claude` (the nested session takes its own slot). A tool approved at a permission prompt then runs without a slot; the agent rejoins FIFO before its next inference. If another ordinary tool from that parent is still running in parallel, the parent keeps its ticket until that work finishes. A suspended parent joins FIFO again before its next inference or ordinary tool. This prevents four parents from holding every slot while waiting for children that cannot start.
 
 ### Upgrading from 0.2.x or the private prototype
 

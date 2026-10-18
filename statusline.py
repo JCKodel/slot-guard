@@ -31,8 +31,9 @@ def badge(home, session):
                 control = {}  # Created by the first coordinator call of 0.5.0.
             # Queue order is rank, then sequence; a database not yet migrated has no rank.
             columns = {r[1] for r in conn.execute('PRAGMA table_info(tickets)')}
-            ahead = ('(q.rank<t.rank OR (q.rank=t.rank AND q.seq<=t.seq))' if 'rank' in columns
-                     else 'q.seq<=t.seq')
+            place = 'coalesce({0}.pos, {0}.seq)' if 'pos' in columns else '{0}.seq'
+            ahead = (f"(q.rank<t.rank OR (q.rank=t.rank AND {place.format('q')}<={place.format('t')}))"
+                     if 'rank' in columns else 'q.seq<=t.seq')
             rows = conn.execute(f"""SELECT t.pool,
                 (SELECT count(*) FROM tickets q
                  WHERE q.pool=t.pool AND q.state='queued' AND {ahead})

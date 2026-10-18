@@ -419,6 +419,50 @@ class AutoQueueTests(unittest.TestCase):
             self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':24 + (minutes >= 60) * 2,'resets':resets}]})
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
 
+    def age_grant(self, key, seconds):
+        self.q.db.execute('UPDATE tickets SET since=since-? WHERE key=?', (seconds, key)); self.q.db.commit()
+
+    def state_of(self, key):
+        return self.q.db.execute('SELECT state FROM tickets WHERE key=?', (key,)).fetchone()[0]
+
+    def test_rotation_hands_the_slot_on_after_a_quantum_only_when_someone_waits(self):
+        q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b'}.get)
+        self.q.db.close(); self.q = q
+        self.q.operate(self.ticket('a'))
+        self.age_grant('a', 120)
+        self.assertEqual(self.q.operate(self.ticket('a', rotate=True))['state'], 'granted')  # Nobody waits.
+        self.q.operate(self.ticket('b'))
+        self.age_grant('a', 30)
+        self.assertEqual(self.q.operate(self.ticket('a', rotate=True))['state'], 'queued')  # Quantum over.
+        self.assertEqual(self.state_of('b'), 'granted')
+        self.assertEqual(self.q.operate(self.ticket('b', rotate=True))['state'], 'granted')  # Its own quantum.
+        self.age_grant('b', 61)
+        self.assertEqual(self.q.operate({'op':'rotate','keys':['b'],'pid':10,'birth':'b'})['rotated'], ['b'])
+        self.assertEqual((self.state_of('a'), self.state_of('b')), ('granted', 'queued'))
+        self.assertEqual(self.q.db.execute("SELECT count(*) FROM tickets WHERE state='granted'").fetchone()[0], 1)
+
+    def test_rotated_agents_queue_behind_first_grants(self):
+        q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b'}.get)
+        self.q.db.close(); self.q = q
+        self.q.operate(self.ticket('a', rank=0)); self.q.operate(self.ticket('b', rank=0))
+        self.age_grant('a', 61)
+        self.q.operate({'op':'rotate','keys':['a'],'pid':10,'birth':'b'})
+        self.q.operate(self.ticket('child', rank=0))
+        # b (waiting first grant) runs; the new child goes before a, which already had its turn.
+        self.assertEqual(self.state_of('b'), 'granted')
+        self.q.operate({'op':'release','key':'b','pool':'agent','session':'s','turn':'b','pid':10,'birth':'b'})
+        self.assertEqual((self.state_of('child'), self.state_of('a')), ('granted', 'queued'))
+
+    def test_rotate_ignores_other_owners_and_fresh_restarts_the_quantum(self):
+        q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b', 11:'c'}.get)
+        self.q.db.close(); self.q = q
+        self.q.operate(self.ticket('a')); self.q.operate(self.ticket('b'))
+        self.age_grant('a', 120)
+        self.assertEqual(self.q.operate({'op':'rotate','keys':['a'],'pid':11,'birth':'c'})['rotated'], [])
+        self.q.operate(self.ticket('a', fresh=True))
+        self.assertEqual(self.q.operate({'op':'rotate','keys':['a'],'pid':10,'birth':'b'})['rotated'], [])
+        self.assertEqual(self.state_of('a'), 'granted')
+
     def test_auto_off_ignores_usage(self):
         q = Queue(Path(self.temp.name)/'q2.db', 3, {10:'b'}.get, auto=False, clock=lambda: self.now)
         try:

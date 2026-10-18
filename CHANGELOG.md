@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0-beta.1
+
+- Cooperative multitasking. The limit now counts agents in a model call; tools run on the agent's ticket and never wait for a slot. An agent that has held its slot for the quantum (60 s, `configure --quantum`) hands it to the next in line between model calls (at a tool's start, or every 30 s during a long tool) and queues again; nothing happens when nobody waits. With the limit at 1, agents take turns instead of one holding the slot for its whole turn.
+- Rotation happens only between model calls, in one coordinator transaction, so no more than the limit are ever in a model call. Rotated agents queue behind agents still waiting for their first grant of a turn.
+- Verified against the real engine: two sessions at limit 1 take turns step by step, and sampling the queue every 50 ms never shows more than one grant.
+
 ## 0.5.3-beta.1
 
 - The weekly window follows a linear quota (about 14.3% a day): while usage is above the line the limit drops, down to 1 agent, and does not rise until it is back under. It never pauses for the line. Replaces 0.5.1's tolerant weekly policy, which let a fast start borrow from the rest of the week.

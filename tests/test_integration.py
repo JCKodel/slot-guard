@@ -49,7 +49,7 @@ class IntegrationTests(unittest.TestCase):
             time.sleep(.05)
         self.fail('Timed out waiting for condition')
 
-    def claude(self, delay=.1, home=None, children=False, stream=False, mode="", heartbeat=None):
+    def claude(self, delay=.1, home=None, children=False, stream=False, mode="", heartbeat=None, steps=None):
         sid=str(uuid.uuid4())
         home=home or self.home
         env={**test_environment(),'CLAUDE_SLOT_HOME':str(home),'SLOT_TEST_DELAY':str(delay),
@@ -57,14 +57,15 @@ class IntegrationTests(unittest.TestCase):
              'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1',
              'ANTHROPIC_API_KEY':'local-test-not-a-key', 'ANTHROPIC_BASE_URL':'http://127.0.0.1:1'}
         if heartbeat: env['SLOT_HEARTBEAT_MS']=str(heartbeat)
+        if steps: env['SLOT_TEST_STEPS']=str(steps)
         command=[shutil.which('claude'),'-p','Local test, no inference.',
             '--plugin-dir',str(ROOT),'--plugin-dir',str(ROOT/'tests/fixtures/fake-model'),
-            '--setting-sources','','--strict-mcp-config','--tools','Agent,Bash' if children or mode=='tools' else '',
+            '--setting-sources','','--strict-mcp-config','--tools','Agent,Bash' if children or mode in ('tools','steps') else '',
             '--disable-slash-commands','--no-session-persistence','--prompt-suggestions','false',
             '--system-prompt','Test.','--model','haiku','--effort','low',
             '--session-id',sid,'--max-budget-usd','0.01','--output-format','json',
             '--debug-file',str(self.home/(sid+'.debug.log'))]
-        if children or mode=='tools': command += ['--allowedTools','Agent','Bash','--permission-mode','dontAsk']
+        if children or mode in ('tools','steps'): command += ['--allowedTools','Agent','Bash','--permission-mode','dontAsk']
         if stream:
             command.remove('Local test, no inference.')
             command[command.index('--output-format')+1]='stream-json'
@@ -241,6 +242,31 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
         self.assertEqual([t['state'] for t in self.status() if t['session']==sid],['queued'])
         self.result(p)
         self.assertTrue((self.home/(sid+'.finished')).exists())
+
+    def test_one_slot_is_shared_by_turns_and_never_doubled(self):
+        initialize(self.home, 1, replace=True, quantum=2)
+        peak=[0]; done=[False]
+        import threading
+        def watch():
+            while not done[0]:
+                try:
+                    db=sqlite3.connect(self.home/'queue.sqlite3')
+                    try: peak[0]=max(peak[0],db.execute("SELECT count(*) FROM tickets WHERE state='granted'").fetchone()[0])
+                    finally: db.close()
+                except sqlite3.Error: pass
+                time.sleep(.05)
+        watcher=threading.Thread(target=watch); watcher.start()
+        try:
+            runs=[self.claude(delay=1.5, mode='steps', steps=4) for _ in range(2)]
+            for sid,p in runs: self.result(p)
+        finally:
+            done[0]=True; watcher.join()
+        self.assertEqual(peak[0],1)
+        starts=sorted((float((self.home/f'{sid}.step{i}').read_text()), sid) for sid,_ in runs for i in range(4))
+        order=[sid for _,sid in starts]
+        switches=sum(a!=b for a,b in zip(order,order[1:]))
+        # Without turn-taking one session runs all its steps, then the other: one switch.
+        self.assertGreaterEqual(switches,3,order)
 
     def test_interrupt_waiting_turn_keeps_session_usable(self):
         for i in range(4): local_call(self.home,self.ticket(str(i)))

@@ -20,13 +20,14 @@ async function call($, data) {
   return result;
 }
 // Resolves true when granted, false when the ticket was released (canceled, evicted, expired).
-async function acquire($, ticket, signal, registry, forceAfter) {
+async function acquire($, ticket, signal, registry, forceAfter, once={}) {
   let first=true, paused=false;
   const since=Date.now();
   for (;;) {
     signal.throwIfAborted();
     const force=forceAfter!=null && Date.now()-since>=forceAfter;
-    const r=await call($,{...ticket,op:'acquire',wait:first||force?0:Math.min(15,forceAfter==null?15:Math.max(0,(since+forceAfter-Date.now())/1000)),...(force?{force:true}:{})});
+    const r=await call($,{...ticket,op:'acquire',wait:first||force?0:Math.min(15,forceAfter==null?15:Math.max(0,(since+forceAfter-Date.now())/1000)),
+      ...(force?{force:true}:{}),...(first?once:{})});
     first=false;
     if(r.paused_until) registry.pausedUntil=r.paused_until*1000;
     signal.throwIfAborted();
@@ -46,7 +47,7 @@ function locked(state, fn) {
 }
 function newState(registry,session,e) {
   return {registry,session,turn:e.turnId,agent:e.agentId||'main',generation:0,ticket:null,
-    busy:0,waiting:0,agentWaits:0,acquiring:false,closed:false,active:Date.now(),tail:Promise.resolve()};
+    busy:0,steps:0,waiting:0,agentWaits:0,acquiring:false,closed:false,active:Date.now(),tail:Promise.resolve()};
 }
 // Never throws: a failed release is retried later, and the lease is the last resort.
 async function release($, state) {
@@ -74,11 +75,20 @@ async function yieldSlot($,state) {
   if(state.agentWaits>0 && state.ticket) park(state);
   else await release($,state);
 }
+// Cooperative multitasking. Only model calls need a granted slot: tools run on the agent's
+// ticket, granted or queued. Between model calls an agent that has held its slot for the
+// coordinator's quantum hands it to the next in line and queues again; never mid-call.
+const between = state => state.busy===0 && state.steps===0;
+async function offer($,state) {
+  if(state.ticket && between(state)) await call($,{op:'rotate',keys:[state.ticket.key]}).catch(()=>{});
+}
 async function enter($,state,signal,step=false) {
   return locked(state,async()=>{
     if(state.closed) throw new Error('Agent turn already ended');
+    if(!step) {await offer($,state); state.busy++; state.active=Date.now(); return;}
     for(let attempt=0;;attempt++) {
-      if(!state.ticket) state.ticket=claim(state);
+      let once=between(state) && state.ticket ? {rotate:true} : {};
+      if(!state.ticket) {state.ticket=claim(state); if(state.ticket) once={fresh:true};}
       if(!state.ticket) {
         const generation=++state.generation;
         state.ticket={pool:'agent',instance,session:state.session,turn:state.turn,
@@ -89,7 +99,7 @@ async function enter($,state,signal,step=false) {
       state.registry.held.add(state);
       let granted;
       state.acquiring=true;
-      try {granted=await acquire($,state.ticket,signal,state.registry,step && state.agent!=='main' ? FORCE_MS : null);}
+      try {granted=await acquire($,state.ticket,signal,state.registry,state.agent!=='main' ? FORCE_MS : null,once);}
       catch(error) {await release($,state); throw error;}
       finally {state.acquiring=false;}
       if(granted) break;
@@ -97,12 +107,12 @@ async function enter($,state,signal,step=false) {
       state.ticket=null; state.registry.held.delete(state);
       if(attempt>0) throw new Error('Reservation canceled');
     }
-    state.busy++; state.active=Date.now();
+    state.busy++; state.steps++; state.active=Date.now();
   });
 }
-async function leave($,state) {
+async function leave($,state,step=false) {
   return locked(state,async()=>{
-    state.busy--; state.active=Date.now();
+    state.busy--; if(step) state.steps--; state.active=Date.now();
     if(state.busy===0 && state.closed) await release($,state);
     else if(state.busy===0 && state.waiting>0) await yieldSlot($,state);
   });
@@ -152,7 +162,7 @@ async function report($,registry,limits) {
   registry.reported=signature;
 }
 async function heartbeat($,{held,orphans,pausedUntil,parked}) {
-  const now=Date.now(), keys=[];
+  const now=Date.now(), keys=[], longTools=[];
   for(const [owner,slot] of parked) {
     if(now-slot.at>PARK_MS) {
       parked.delete(owner);
@@ -170,8 +180,11 @@ async function heartbeat($,{held,orphans,pausedUntil,parked}) {
       continue;
     }
     keys.push(state.ticket.key);
+    // An agent in a long tool, between model calls, offers its slot like at a tool's start.
+    if(state.busy>0 && state.steps===0 && !state.acquiring) longTools.push(state.ticket.key);
   }
   if(keys.length) await call($,{op:'touch',keys}).catch(()=>{});
+  if(longTools.length) await call($,{op:'rotate',keys:longTools}).catch(()=>{});
   await flush($,orphans);
 }
 
@@ -258,7 +271,7 @@ export function register(on) {
       try {await $.turn.abort({turnId:e.turnId});} catch {}
       return emptyStep(e);
     } finally {
-      if(entered) await leave($,state);
+      if(entered) await leave($,state,true);
     }
   }).catch(async function*($,e){
     try {await $.turn.abort({turnId:e.turnId});} catch {}

@@ -16,6 +16,17 @@ export function register(on) {
       yield {kind:'stop',stopReason:'tool_use',usage:null};
       return {turnId:e.turnId,index:e.index,answer:'',toolUses:[{name:'Bash',input}],stopReason:'tool_use',usage:null};
     }
+    if (mode === 'steps' && e.index < Number(await $.env.get('SLOT_TEST_STEPS') || 3)) {
+      // A model call that takes a while, then a short tool: the shape of real agent work.
+      await $.fs.write(home + '/' + name + '.step' + e.index, String(Date.now()));
+      await $.process.run(['python3', '-c', 'import time; time.sleep(float(__import__("sys").argv[1]))', delay || '1'],
+        {timeoutMs: (Number(delay || 1) + 30) * 1000});
+      const input = {command:'sleep 1', description:'Local slot test tool', timeout:30000};
+      yield {kind:'tool',index:0,id:'step-tool-'+e.index,name:'Bash'};
+      yield {kind:'input',index:0,json:JSON.stringify(input)};
+      yield {kind:'stop',stopReason:'tool_use',usage:null};
+      return {turnId:e.turnId,index:e.index,answer:'',toolUses:[{name:'Bash',input}],stopReason:'tool_use',usage:null};
+    }
     if (mode === 'barrier' && !e.agentId && !spawned) {
       await $.fs.write(home + '/' + name + '.parent-ready', 'ready');
       await $.process.run(['python3','-c',
