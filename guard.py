@@ -41,6 +41,9 @@ AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
 # for the weekly one), so a fast start cannot borrow from the rest of the week.
 LINEAR = {'seven_day'}
 LINEAR_SLACK = 1.0  # Percent: readings come in whole points.
+# A reading of the same window this many points under the stored one means the account's
+# window started over (a plan change); readings from concurrent responses differ by less.
+RESTART_DROP = 5.0
 
 
 # Recent burn rate: readings over this span, at least MIN apart (percent moves in whole points).
@@ -396,6 +399,18 @@ class Queue:
                                     (time.time(), *seqs)).rowcount
                 self._promote()
             return {'evicted': n}
+        if op == 'reset':
+            # The automatic limit starts again from the normal limit, now. With `usage`, the
+            # stored readings go too: after a plan change the account's windows start over,
+            # but a reading of the same window never goes down here.
+            with self.db:
+                self.db.execute('DELETE FROM control')
+                self.db.execute("INSERT INTO control VALUES ('changed',?)", (self.clock(),))
+                if data.get('usage') is True:
+                    self.db.execute('DELETE FROM usage')
+                    self.db.execute('DELETE FROM usage_log')
+                self._promote()
+            return {'limit': self.limits['agent']}
         if op == 'usage':
             readings = data.get('readings')
             if not isinstance(readings, list) or len(readings) > 8:
@@ -406,7 +421,15 @@ class Queue:
                             type(r.get(k)) not in (int, float) or not 0 <= r[k] < 1e10 for k in ('percent', 'resets')):
                         raise ValueError('Invalid reading')
                     row = self.db.execute('SELECT percent,resets FROM usage WHERE kind=?', (r['kind'],)).fetchone()
-                    if row and abs(row['resets'] - r['resets']) <= 60:
+                    if row and abs(row['resets'] - r['resets']) <= 60 and r['percent'] < row['percent'] - RESTART_DROP:
+                        # The account's window started over (a plan change) without a new reset time.
+                        # Concurrent responses never disagree this much. Its history is stale too,
+                        # and the limit starts again from the normal one, as after a renewal.
+                        percent = r['percent']
+                        self.db.execute('DELETE FROM usage_log WHERE kind=?', (r['kind'],))
+                        self.db.execute("DELETE FROM control WHERE name IN ('limit','changed')")
+                        self.note({'at': self.clock(), 'restart': r['kind'], 'from': row['percent'], 'to': percent})
+                    elif row and abs(row['resets'] - r['resets']) <= 60:
                         # Sessions report the same window from different responses: usage only grows.
                         percent = max(row['percent'], r['percent'])
                     elif row and row['resets'] > r['resets']:
@@ -600,6 +623,27 @@ def initialize(home, agents=DEFAULT_AGENTS, replace=False, auto=None, ceiling=No
     return local_call(home, {'op':'status'}) if report else None
 
 
+def configure(home, data):
+    """Change the configuration from the mod or the command line, and apply it now.
+
+    data: any of agents, max, quantum (positive integers) and auto (boolean).
+    The automatic limit restarts from the new normal limit instead of climbing
+    to it one slot per AUTO_STEP. Returns the configuration and the status.
+    """
+    fields = {k: data.get(k) for k in ('agents', 'max', 'quantum', 'auto')}
+    if all(v is None for v in fields.values()):
+        raise ValueError('configure needs agents, max, quantum and/or auto')
+    for k in ('agents', 'max', 'quantum'):
+        if fields[k] is not None and (type(fields[k]) is not int or fields[k] < 1):
+            raise ValueError(f'{k} must be a positive integer')
+    if fields['auto'] is not None and type(fields['auto']) is not bool:
+        raise ValueError('auto must be on or off')
+    initialize(home, fields['agents'], replace=True, auto=fields['auto'], ceiling=fields['max'],
+               quantum=fields['quantum'], report=False)
+    local_call(home, {'op': 'reset'})
+    return {'config': json.loads((home/'config.json').read_text()), **local_call(home, {'op': 'status'})}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--home', type=Path, default=Path(os.environ.get('CLAUDE_SLOT_HOME', DEFAULT_HOME)))
@@ -614,29 +658,33 @@ def main():
     sub.add_parser('status')
     e = sub.add_parser('evict', help='Release tickets by number, as listed by status or /slots')
     e.add_argument('seqs', type=int, nargs='+')
+    sub.add_parser('reset', help='Forget the usage readings and restart the automatic limit from the normal limit (after a plan change)')
     sub.add_parser('client')
     args = p.parse_args()
     os.umask(0o077)
     if args.command == 'init':
         print(json.dumps(initialize(args.home, args.agents), indent=2))
     elif args.command == 'configure':
-        if args.agents is None and args.auto is None and args.max is None and args.quantum is None:
-            p.error('configure needs --agents, --auto, --max and/or --quantum')
-        if args.quantum is not None and args.quantum < 1:
-            p.error('--quantum must be a positive integer')
-        if args.max is not None and args.max < 1:
-            p.error('--max must be a positive integer')
         auto = None if args.auto is None else args.auto == 'on'
-        print(json.dumps(initialize(args.home, args.agents, replace=True, auto=auto, ceiling=args.max,
-                                    quantum=args.quantum), indent=2))
+        try:
+            result = configure(args.home, {'agents': args.agents, 'auto': auto, 'max': args.max, 'quantum': args.quantum})
+        except ValueError as error:
+            p.error(str(error))
+        print(json.dumps(result, indent=2))
     elif args.command == 'status':
         print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
     elif args.command == 'evict':
         print(json.dumps(local_call(args.home, {'op':'evict', 'seqs':args.seqs}), indent=2))
+    elif args.command == 'reset':
+        initialize(args.home, report=False)
+        print(json.dumps(local_call(args.home, {'op':'reset', 'usage':True}), indent=2))
     else:
         initialize(args.home, report=False)
         data = json.loads(sys.stdin.read(MAX_MESSAGE))
-        if data.get('op') not in ('status', 'evict'):
+        if data.get('op') == 'configure':
+            print(json.dumps(configure(args.home, data)))
+            return
+        if data.get('op') not in ('status', 'evict', 'reset'):
             data.update(claude_owner())
         print(json.dumps(local_call(args.home, data)))
 

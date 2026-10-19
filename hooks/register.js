@@ -194,6 +194,33 @@ async function heartbeat($,{held,orphans,pausedUntil,parked}) {
   await flush($,orphans);
 }
 
+const HELP=[
+  'Slot Guard: one machine-wide limit on working agents (main agents and subagents, every terminal).',
+  '',
+  '/slots                 Show the limit, who is working and who waits (FIFO).',
+  '/slots agents N        Set the normal limit to N agents, applied now; with the automatic limit it is the usual maximum.',
+  '/slots max N           With the automatic limit, allow up to N agents while every usage window has plenty left.',
+  '/slots auto on|off     Pace the limit by the usage windows (on), or keep it fixed at "agents" (off).',
+  '/slots quantum N       Seconds an agent keeps its slot while others wait (default 60).',
+  '/slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a pause now.',
+  '/slots evict N [N...]  Release ticket N by hand (numbers as listed by /slots).',
+  '/slots help            This text.',
+  '',
+  'Changes apply to every session at once; running work finishes and the queue drains to the new limit.',
+  'The same is available from a checkout: python3 guard.py configure|status|reset|evict.',
+].join('\n');
+async function status($,s) {
+  s=s||await call($,{op:'status'});
+  const count=state=>s.tickets.filter(t=>t.state===state).length;
+  const lines=s.tickets.map(t=>`#${t.seq} ${t.state} session ${t.session.slice(0,8)} pid ${t.pid}, renewed ${t.idle}s ago`);
+  const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
+    [`Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots reset" or "/slots auto off" resumes now.`] : [];
+  const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
+    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h lately`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
+  const over=count('granted')-s.limits.agent;
+  if(over>0) auto.push(`${over} over the limit: subagents admitted before Claude Code's 10-minute stall limit; nothing new starts until they finish.`);
+  return [`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot. "/slots help" lists the subcommands.`,...auto,...lines].join('\n');
+}
 export function register(on) {
   const states=new Map();
   // States holding a ticket (closed ones still unwinding too), and tickets whose release failed.
@@ -204,8 +231,8 @@ export function register(on) {
   const key=e=>e.agentId||'main';
   let timer=null;
   on('session.start',async($,e,next)=>{
-    await $.command.register({name:'slots',description:'Show the global working-agent limit and FIFO queue; "/slots evict N" frees ticket N.',
-      argumentHint:'[evict N...]',immediate:true});
+    await $.command.register({name:'slots',description:'Show or change the global working-agent limit and FIFO queue; "/slots help" lists the subcommands.',
+      argumentHint:'[help | agents N | max N | auto on|off | quantum N | reset | evict N...]',immediate:true});
     if(!timer) {
       // Tickets a previous load of this mod held in this process can no longer be released by it.
       await call($,{op:'adopt',instance}).catch(()=>{});
@@ -223,22 +250,30 @@ export function register(on) {
   on('command.run',{command:'slots'},async($,e)=>{
     try {
       const words=String(e.args||'').trim().split(/\s+/).filter(Boolean);
-      if(words[0]==='evict') {
-        const seqs=words.slice(1).map(w=>Number(w.replace(/^#/,'')));
-        if(!seqs.length || seqs.some(n=>!Number.isInteger(n))) return {text:'Usage: /slots evict N [N...]'};
+      const [verb,...rest]=words;
+      if(verb===undefined) return {text:await status($)};
+      if(verb==='evict') {
+        const seqs=rest.map(w=>Number(w.replace(/^#/,'')));
+        if(!seqs.length || seqs.some(n=>!Number.isInteger(n))) return {text:'Usage: /slots evict N [N...]\n\n'+HELP};
         const r=await call($,{op:'evict',seqs});
         return {text:`Slot Guard: ${r.evicted} ticket(s) released.`};
       }
-      const s=await call($,{op:'status'});
-      const count=state=>s.tickets.filter(t=>t.state===state).length;
-      const lines=s.tickets.map(t=>`#${t.seq} ${t.state} session ${t.session.slice(0,8)} pid ${t.pid}, renewed ${t.idle}s ago`);
-      const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
-        [`Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "python3 guard.py configure --auto off" resumes now.`] : [];
-      const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
-        (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h lately`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
-      const over=count('granted')-s.limits.agent;
-      if(over>0) auto.push(`${over} over the limit: subagents admitted before Claude Code's 10-minute stall limit; nothing new starts until they finish.`);
-      return {text:[`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot.`,...auto,...lines].join('\n')};
+      if(verb==='reset') {
+        if(rest.length) return {text:'Usage: /slots reset\n\n'+HELP};
+        const r=await call($,{op:'reset',usage:true});
+        return {text:`Slot Guard: usage readings forgotten; the limit is ${r.limit} again until new readings arrive.\n`+await status($)};
+      }
+      if(verb==='agents' || verb==='max' || verb==='quantum' || verb==='auto') {
+        const value=verb==='auto' ? {on:true,off:false}[rest[0]] : Number(rest[0]);
+        const valid=rest.length===1 && (verb==='auto' ? value!==undefined : Number.isInteger(value) && value>=1);
+        if(!valid) return {text:`Usage: /slots ${verb} ${verb==='auto'?'on|off':'N'}\n\n`+HELP};
+        const r=await call($,{op:'configure',[verb]:value});
+        const notes=[];
+        if(verb==='max' && !r.config.max) notes.push(`A maximum at or under the normal limit (${r.config.agents}) is the normal limit itself; raise "agents" instead.`);
+        if(verb==='agents' && !r.config.auto) notes.push('The automatic limit is off: this is a fixed limit.');
+        return {text:[`Slot Guard: ${verb} set to ${verb==='auto'?rest[0]:value}, applied now.`,...notes,await status($,r)].join('\n')};
+      }
+      return {text:(verb==='help' ? '' : `Unknown subcommand "${verb}".\n\n`)+HELP};
     } catch(error) {return {text:'Slot Guard: '+String(error)};}
   });
   // Pushed when a usage window moves a whole point; the heartbeat covers quiet periods.

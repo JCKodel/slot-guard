@@ -59,6 +59,6 @@ test('real runtime: slots command reports local occupancy without inference', as
       {seq:8,pool:'agent',state:'queued',session:'abcdefghij',pid:43,idle:0}]
   })}}))
   const result = await $.command.run({command:'slots',args:''})
-  expect(result.text).toBe(['Agents: 1/4 working; 1 waiting (FIFO). Parents waiting only for children yield their slot.',
+  expect(result.text).toBe(['Agents: 1/4 working; 1 waiting (FIFO). Parents waiting only for children yield their slot. "/slots help" lists the subcommands.',
     '#7 granted session 01234567 pid 42, renewed 3s ago','#8 queued session abcdefgh pid 43, renewed 0s ago'].join('\n'))
 })

@@ -18,7 +18,7 @@ Make sure `python3` is on the PATH used by Claude Code. From your terminal:
 claude plugin install slot-guard --marketplace JCKodel/slot-guard
 ```
 
-Restart all Claude Code sessions that should participate. The first use creates private state in `~/.local/state/slot-guard` with **3 working-agent slots**. See [Choosing a limit](#choosing-a-limit) for your plan. Run `/slots` in Claude Code to inspect occupancy and the queue. This is a local command, not a prompt sent to a model.
+Restart all Claude Code sessions that should participate. The first use creates private state in `~/.local/state/slot-guard` with **3 working-agent slots**. See [Choosing a limit](#choosing-a-limit) for your plan. Run `/slots` in Claude Code to inspect occupancy and the queue, and `/slots help` for the subcommands that change the limits. These are local commands, not prompts sent to a model.
 
 Do not enable two copies of Slot Guard in one session. If you used the earlier private prototype, disable it before enabling this version. The public version intentionally uses a different state directory; the two versions do not coordinate with each other by default.
 
@@ -33,17 +33,30 @@ If you installed the optional statusline below, restore it before removing the c
 
 ## Configure limits
 
-For configuration and optional statusline installation, keep a checkout:
+Everything can be changed from inside Claude Code with one command and its subcommands (`/slots help` prints this list):
+
+```
+/slots                 Show the limit, who is working and who waits (FIFO).
+/slots agents N        Set the normal limit to N agents, applied now.
+/slots max N           With the automatic limit, allow up to N agents while every usage window has plenty left.
+/slots auto on|off     Pace the limit by the usage windows (on), or keep it fixed at "agents" (off).
+/slots quantum N       Seconds an agent keeps its slot while others wait (default 60).
+/slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a pause now.
+/slots evict N [N...]  Release ticket N by hand (numbers as listed by /slots).
+```
+
+The same is available from a checkout, which the optional statusline installation also needs:
 
 ```sh
 git clone https://github.com/JCKodel/slot-guard.git
 cd slot-guard
 python3 guard.py configure --agents 3
 python3 guard.py status
+python3 guard.py reset         # same as /slots reset
 python3 guard.py evict 12      # free ticket #12 by hand
 ```
 
-`--agents` is the single global limit. Three sessions without children, two working parents plus one working child, or one working parent plus two children all use three slots. Idle terminals and parents suspended waiting only for children do not count as working. A new limit applies at once to every session; work already running finishes, and the queue drains to the new limit.
+`--agents` (or `/slots agents N`) is the single global limit. Three sessions without children, two working parents plus one working child, or one working parent plus two children all use three slots. Idle terminals and parents suspended waiting only for children do not count as working. A new limit applies at once to every session; work already running finishes, and the queue drains to the new limit.
 
 ### Choosing a limit
 
@@ -68,6 +81,7 @@ With the automatic limit (on by default), `--agents` is the **normal** limit and
 - **The 5-hour window** acts at 10% off pace and can go down to 1 agent. **The weekly window** also follows a **linear quota**: used share no higher than elapsed share, about 14.3% a day (one point of slack for whole-point readings). While usage is above that line the limit drops, down to 1 agent, and does not rise until usage is back under it. It never pauses for the weekly line; only a window at 95% pauses.
 - **A window reaches 95%**: every agent pauses, including those already working, at their next model step or tool (nothing running is cut off). They resume by themselves when that window renews, in FIFO order, with no intervention. Running into Claude's own limit would stop everything until you continue it by hand. Claude Code fails a subagent whose model step makes no progress for 10 minutes ("Agent stalled"); a subagent paused longer than that fails, and its parent, itself paused, sees the failure when the window renews.
 - **No reading** (not on a subscription, or the window has renewed and no session has reported yet): the maximum applies, as with a fixed limit.
+- **A plan change**: upgrading your plan starts the account's windows over without changing their reset times. Sessions report the same window from different responses, so the coordinator normally keeps the highest reading for a window; a reading more than 5 points *under* the stored one is taken as such a restart instead, and the limit starts again from the normal limit. `/slots reset` does the same by hand, and also ends a pause at once.
 
 The pace aims to finish each window at 95%. The first 15 minutes of a window are not acted on, their pace being too noisy. Lowering the limit never interrupts work in progress; the queue drains to it. Usage from other places (claude.ai, other machines) counts, since the figures are the account's. Every change is logged to `auto.log` in the state directory. A pause only holds once every participating session runs 0.5.0 or later: restart them after updating.
 
@@ -79,7 +93,7 @@ python3 guard.py configure --auto on
 python3 guard.py status                 # limit, maximum, and each window's usage, elapsed time and pace
 ```
 
-`/slots` shows the same, and the statusline marks it: `Agents ■■ 2/2 (auto, normal 3)`, or `Agents ⏸ paused until 14:05 (usage limit near)`. `configure --auto off` ends a pause at once.
+`/slots` shows the same, and the statusline marks it: `Agents ■■ 2/2 (auto, normal 3)`, or `Agents ⏸ paused until 14:05 (usage limit near)`. `/slots reset` or `/slots auto off` ends a pause at once. Any configuration change applies at once: the automatic limit restarts from the new normal limit instead of climbing to it one slot per 10 minutes.
 
 ### Subagents and the 10-minute stall limit
 
@@ -159,7 +173,7 @@ On macOS, process inspection uses `/usr/lib/libproc.dylib` without another subpr
 
 ### Data, destinations, and credentials
 
-The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, `release`, `touch`, `adopt`, `evict`, or `usage`), the single `agent` pool, session ID, turn ID, ticket key (including mod load ID, agent ID and admission generation), ticket numbers to evict, and the usage windows Claude Code reports to the session (kind, percentage used, reset time), and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
+The mod sends JSON **only to the local Python child's stdin**: operation (`status`, `acquire`, `release`, `touch`, `rotate`, `adopt`, `evict`, `usage`, `reset`, or `configure`), the single `agent` pool, session ID, turn ID, ticket key (including mod load ID, agent ID and admission generation), ticket numbers to evict, the limits typed at `/slots`, the usage windows Claude Code reports to the session (kind, percentage used, reset time), and polling wait duration. The child adds the owner PID and birth identity. JSON results return on stdout; errors return on stderr and may appear in Claude's local status UI.
 
 `guard.py` reads/writes `config.json`, `queue.sqlite3` (including SQLite journal files), and local lock/temporary files under `~/.local/state/slot-guard`, or the explicitly configured `CLAUDE_SLOT_HOME`. Stored records contain coordination identifiers, ownership, state, sequence, and creation timestamps. Stored records also carry the last renewal time and the mod load that created them. The latest usage window figures and the automatic limit's state are kept too. Released records are deleted when their owner exits, or one hour after release. State remains after uninstall; remove it only after all participating sessions have stopped.
 

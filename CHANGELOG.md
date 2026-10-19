@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2-beta.1
+
+- `/slots` gains subcommands, listed by `/slots help`: `agents N`, `max N`, `auto on|off`, `quantum N`, `reset`, next to `evict`. No checkout needed to change the limits.
+- A configuration change applies at once: the automatic limit restarts from the new normal limit instead of climbing to it one slot per 10 minutes. `guard.py configure` does the same.
+- Plan changes: upgrading a plan starts the account's usage windows over without changing their reset times, and the coordinator kept the old, higher reading of each window (it keeps the highest for the same reset time, since sessions report it from different responses). The limit then stayed at 1 against the weekly line. A reading more than 5 points under the stored one now counts as a restart of the window: it replaces the reading and the limit starts again from the normal limit. `/slots reset` (or `guard.py reset`) forgets every reading by hand and ends a pause at once.
+
 ## 0.6.1-beta.1
 
 - Fix a race in 0.6.0: the heartbeat chose agents in long tools, then offered their slots after renewing tickets; a model call starting in between could lose its slot mid-call, letting another agent in. The offer is now decided under the agent's lock, the same one a model call's admission takes.

@@ -183,6 +183,28 @@ test('slots command evicts by ticket number',async()=>{
   assert.deepEqual(h.calls.at(-1),{op:'evict',seqs:[12,13]});assert.match(r.text,/2 ticket/);
   assert.match((await h.handlers['command.run'](h.$,{command:'slots',args:'evict x'})).text,/Usage/);
 });
+test('slots subcommands configure and reset, with help on misuse',async()=>{
+  const status={limits:{agent:5},auto:{enabled:true,cap:5,max:5,target:95,windows:[]},tickets:[]};
+  const h=harness(async d=>d.op==='configure'?{config:{agents:5,auto:true,schema:2},...status}:d.op==='reset'?{limit:5}:status);
+  let r=await h.handlers['command.run'](h.$,{command:'slots',args:'agents 5'});
+  assert.deepEqual(h.calls.at(-1),{op:'configure',agents:5});assert.match(r.text,/agents set to 5, applied now\.\nAgents: 0\/5 working/);
+  r=await h.handlers['command.run'](h.$,{command:'slots',args:'max 2'});
+  assert.deepEqual(h.calls.at(-1),{op:'configure',max:2});assert.match(r.text,/is the normal limit itself/);
+  r=await h.handlers['command.run'](h.$,{command:'slots',args:'auto off'});
+  assert.deepEqual(h.calls.at(-1),{op:'configure',auto:false});
+  r=await h.handlers['command.run'](h.$,{command:'slots',args:'quantum 90'});
+  assert.deepEqual(h.calls.at(-1),{op:'configure',quantum:90});
+  r=await h.handlers['command.run'](h.$,{command:'slots',args:'reset'});
+  assert.deepEqual(h.calls.at(-2),{op:'reset',usage:true});assert.match(r.text,/readings forgotten; the limit is 5 again/);
+  const sent=h.calls.length;
+  for(const args of ['agents','agents 0','agents x','auto maybe','max 1 2','reset now','bogus','help']) {
+    r=await h.handlers['command.run'](h.$,{command:'slots',args});
+    assert.match(r.text,/\/slots agents N {8}Set the normal limit/,args);
+    assert.match(r.text,args==='help'?/^Slot Guard: one machine-wide/:args==='bogus'?/^Unknown subcommand "bogus"/:/^Usage: \/slots/,args);
+  }
+  assert.equal(h.calls.length,sent);
+  assert.match((await h.handlers['command.run'](h.$,{command:'slots',args:''})).text,/"\/slots help" lists the subcommands/);
+});
 test('an ask answered quickly (auto mode classifier) keeps the slot',async()=>{
   const h=harness();await step(h);
   await h.handlers['tool.call'](h.$,{tool:'Bash',command:'ls',tool_use_id:'u3'},next(async()=>
@@ -215,7 +237,7 @@ test('slots shows the automatic limit and window pace',async()=>{
 test('slots explains a pause and when it ends',async()=>{
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,windows:[]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/Paused: a usage window reached 95%; agents resume when it renews at/);
+  assert.match(r.text,/Paused: a usage window reached 95%; agents resume when it renews at .*"\/slots reset" or "\/slots auto off" resumes now/);
 });
 test('a paused agent says why and clears the notice when it resumes',async()=>{
   let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000}:{state:'granted'});

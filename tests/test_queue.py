@@ -11,7 +11,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import AUTO_STEP, Queue, auto_limit, initialize, local_call, pace, process_identity, recent_rate
+from guard import AUTO_STEP, Queue, auto_limit, configure, initialize, local_call, pace, process_identity, recent_rate
 
 
 class QueueTests(unittest.TestCase):
@@ -376,6 +376,51 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.acquire('a'), 'queued')
         self.now += 31*self.H
         self.assertEqual(self.acquire('a'), 'granted')
+
+    def test_a_plan_change_restarts_the_window_and_the_limit(self):
+        for k in 'abc': self.acquire(k)
+        resets = self.now + 128*self.H  # 24% elapsed.
+        weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
+        weekly(41)  # Over the weekly line.
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 2)
+        self.now += AUTO_STEP
+        self.assertEqual(weekly(39)['limit'], 1)  # A slightly older response.
+        self.assertEqual(self.q.windows()[0]['percent'], 41)
+        self.assertEqual(weekly(1)['limit'], 3)  # The upgraded account's window.
+        self.assertEqual(self.q.windows()[0]['percent'], 1)
+        self.assertIn('restart', (Path(self.temp.name)/'auto.log').read_text())
+        self.assertEqual(self.q.db.execute('SELECT count(*) FROM usage_log').fetchone()[0], 1)
+
+    def test_reset_forgets_readings_and_restarts_from_the_normal_limit(self):
+        self.usage(41, 128, kind='seven_day'); self.usage(95, 1)
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 0)
+        self.assertEqual(self.q.operate({'op':'reset'})['limit'], 0)  # Readings kept: still paused.
+        self.assertEqual(self.q.operate({'op':'reset','usage':True})['limit'], 3)
+        self.assertEqual(self.q.operate({'op':'status'})['auto']['windows'], [])
+        self.assertEqual(self.acquire('a'), 'granted')
+        # The limit only moves again a step after the reset.
+        resets = self.now + 128*self.H
+        weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
+        self.assertEqual(weekly(41)['limit'], 3)
+        self.now += AUTO_STEP
+        self.assertEqual(weekly(42)['limit'], 2)
+
+    def test_configure_applies_the_new_limit_at_once(self):
+        home = Path(self.temp.name)/'home'
+        initialize(home, 3)
+        now = time.time()
+        local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':82,'resets':now+1.1*3600}]})
+        self.assertEqual(local_call(home, {'op':'status'})['limits']['agent'], 2)
+        result = configure(home, {'agents': 5})
+        self.assertEqual((result['config']['agents'], result['limits']['agent']), (5, 5))
+        self.assertEqual(local_call(home, {'op':'status'})['limits']['agent'], 5)
+        self.assertNotIn('max', configure(home, {'max': 2})['config'])  # Never under the normal limit.
+        self.assertEqual(configure(home, {'max': 8})['auto']['max'], 8)
+        self.assertEqual(configure(home, {'auto': False})['auto'], {'enabled': False})
+        self.assertEqual(configure(home, {'quantum': 7})['config']['quantum'], 7)
+        for bad in ({}, {'agents': 0}, {'agents': '3'}, {'auto': 'on'}, {'max': 1.5}):
+            with self.assertRaises(ValueError):
+                configure(home, bad)
 
     def test_configured_maximum_reaches_queue_and_status(self):
         home = Path(self.temp.name)/'home'
