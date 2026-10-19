@@ -6,6 +6,7 @@ Reservations end by explicit release, confirmed owner death, eviction, or an
 expired lease: a mod instance renews its tickets while it is working on them.
 """
 import argparse
+from bisect import bisect_left
 import ctypes
 import errno
 import fcntl
@@ -47,27 +48,53 @@ RESTART_DROP = 5.0
 
 
 # Recent burn rate: readings over this span, at least MIN apart (percent moves in whole points).
-RATE_SPAN = {'five_hour': 3600, 'seven_day': 12 * 3600}
+# For ACTIVE windows both are seconds of activity, not of the clock.
+RATE_SPAN = {'five_hour': 3600, 'seven_day': 4 * 3600}
 RATE_MIN = {'five_hour': 600, 'seven_day': 2 * 3600}
+# Windows measured per active hour (any agent working on this machine) and projected over
+# the hours a day worked lately: nights and days off neither dilute nor inflate the rate.
+ACTIVE = {'seven_day'}
+ACTIVITY_BUCKET = 300  # Seconds: an agent working at any moment of one marks all of it active.
+DUTY_SPAN = 7 * 86400  # Hours a day are learned from the last week,
+DUTY_PRIOR = (8 * 3600, 86400)  # starting from 8 hours a day, weighted as one day.
+DUTY_FLOOR = 1 / 24
 
 
-def recent_rate(history, now, kind):
+def active_time(buckets, start, end):
+    """Seconds of activity from start to end; buckets: sorted start times of active buckets."""
+    return ACTIVITY_BUCKET * (bisect_left(buckets, end) - bisect_left(buckets, start))
+
+
+def duty(buckets, first, now):
+    """Share of the time with an agent working, over the last DUTY_SPAN since `first` (the
+    oldest bucket recorded), with DUTY_PRIOR blended in so a fresh install has a guess."""
+    observed = max(0.0, min(DUTY_SPAN, now - first)) if first is not None else 0.0
+    active = active_time(buckets, now - observed, now + ACTIVITY_BUCKET)
+    share = (active + DUTY_PRIOR[0]) / (observed + DUTY_PRIOR[1])
+    return min(1.0, max(DUTY_FLOOR, share))
+
+
+def recent_rate(history, now, kind, buckets=None):
     """Percent per second over the recent span, or None without enough readings.
 
-    history: (percent, at) pairs of one window, oldest first.
+    history: (percent, at) pairs of one window, oldest first. With `buckets`
+    (see active_time), span, minimum and rate count active seconds only.
     """
-    recent = [(p, t) for p, t in history if now - t <= RATE_SPAN[kind]]
-    if len(recent) < 2 or recent[-1][1] - recent[0][1] < RATE_MIN[kind]:
+    span = (lambda start, end: end - start) if buckets is None else (
+        lambda start, end: active_time(buckets, start, end))
+    recent = [(p, t) for p, t in history if span(t, now) <= RATE_SPAN[kind]]
+    if len(recent) < 2 or span(recent[0][1], recent[-1][1]) < RATE_MIN[kind]:
         return None
     (p0, t0), (p1, _) = recent[0], recent[-1]
-    return max(0.0, p1 - p0) / (now - t0)
+    return max(0.0, p1 - p0) / span(t0, now)
 
 
-def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, linear=False):
+def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, linear=False, duty=1.0):
     """How sustainable usage is: 1 on pace to end at target, below 1 too fast.
 
     With a recent burn rate: the budget left over what that rate spends in the
-    time left. It follows the current load, so the limit recovers once usage
+    time left, of which only the share `duty` is active (a rate per active
+    second). It follows the current load, so the limit recovers once usage
     slows. Without one, the share of budget left over the share of time left.
     With `linear`, also the elapsed share over the used share: below 1 while
     usage is above the straight line from 0 to 100% across the window.
@@ -79,7 +106,7 @@ def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, linear=Fal
         return None
     budget = max(0.0, target - percent)
     if rate is not None:
-        result = budget / (rate * seconds_left) if rate > 0 else float('inf')
+        result = budget / (rate * duty * seconds_left) if rate > 0 else float('inf')
     else:
         result = budget / target / left
     if linear and percent > 0:
@@ -240,6 +267,9 @@ class Queue:
         self.db.execute('CREATE TABLE IF NOT EXISTS control (name TEXT PRIMARY KEY, value REAL NOT NULL)')
         self.db.execute('''CREATE TABLE IF NOT EXISTS usage_log (kind TEXT NOT NULL, resets REAL NOT NULL,
             percent REAL NOT NULL, at REAL NOT NULL)''')
+        # Start times of ACTIVITY_BUCKETs with an agent working; kept through resets and plan
+        # changes, which restart the usage windows but not the user's working hours.
+        self.db.execute('CREATE TABLE IF NOT EXISTS activity (bucket INTEGER PRIMARY KEY)')
         if 'rank' not in columns:
             # 0: work already under way (subagents, resumptions) goes before new prompts (1).
             self.db.execute('ALTER TABLE tickets ADD COLUMN rank INTEGER NOT NULL DEFAULT 1')
@@ -274,18 +304,27 @@ class Queue:
 
     def windows(self):
         now = self.clock()
+        buckets = [b for (b,) in self.db.execute('SELECT bucket FROM activity WHERE bucket>=? ORDER BY bucket',
+                                                 (now - DUTY_SPAN - ACTIVITY_BUCKET,))]
+        first = self.db.execute('SELECT min(bucket) FROM activity').fetchone()[0]
+        share = duty(buckets, first, now)
         result = []
         for r in self.db.execute('SELECT * FROM usage').fetchall():
             if r['kind'] not in WINDOWS:
                 continue
             history = self.db.execute('SELECT percent,at FROM usage_log WHERE kind=? AND abs(resets-?)<=60 ORDER BY at',
                                       (r['kind'], r['resets'])).fetchall()
-            rate = recent_rate([tuple(h) for h in history], now, r['kind'])
-            result.append({'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
-                           'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
-                           'rate': None if rate is None else round(rate * 3600, 2),  # Percent per hour.
-                           'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=rate,
-                                        linear=r['kind'] in LINEAR)})
+            active = r['kind'] in ACTIVE
+            rate = recent_rate([tuple(h) for h in history], now, r['kind'], buckets if active else None)
+            window = {'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
+                      'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
+                      # Percent per hour; per active hour for ACTIVE windows.
+                      'rate': None if rate is None else round(rate * 3600, 2),
+                      'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=rate,
+                                   linear=r['kind'] in LINEAR, duty=share if active else 1.0)}
+            if active:
+                window['hours'] = round(24 * share, 1)  # Active hours a day the rate is projected over.
+            result.append(window)
         return result
 
     def note(self, entry):
@@ -298,6 +337,10 @@ class Queue:
     def _control(self):
         """Set the effective limit; with auto off it is the configured one."""
         value = dict(self.db.execute('SELECT name,value FROM control'))
+        if self.db.execute("SELECT 1 FROM tickets WHERE state='granted' LIMIT 1").fetchone():
+            # Heartbeats renew granted tickets every 30 s, so working time marks every bucket.
+            bucket = int(self.clock() // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
+            self.db.execute('INSERT OR IGNORE INTO activity VALUES (?)', (bucket,))
         limit, until = self.cap, 0
         if self.auto:
             now = self.clock()
@@ -444,6 +487,7 @@ class Queue:
                         self.db.execute('INSERT INTO usage_log VALUES (?,?,?,?)',
                                         (r['kind'], r['resets'], percent, self.clock()))
                 self.db.execute('DELETE FROM usage_log WHERE at<?', (self.clock() - 2 * 86400,))
+                self.db.execute('DELETE FROM activity WHERE bucket<?', (self.clock() - DUTY_SPAN - 86400,))
                 self._promote()
             return {'limit': self.limits['agent']}
         if op == 'rotate':

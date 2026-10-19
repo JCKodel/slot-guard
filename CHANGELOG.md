@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3-beta.1
+
+- The weekly window's burn rate is measured per working hour (time with any agent working on this machine, in 5-minute buckets) and projected over the hours a day worked lately, learned from the last week of activity starting from 8 hours a day. It used to project the recent rate over every hour left in the week, nights included: three busy hours after a plan change lowered the limit toward 1 although the week had plenty left. The rate covers the last 4 working hours, so it follows the current load within the day; the hours a day follow the week.
+- A weekly rate needs readings spanning 2 working hours; until then (after a renewal, a plan change or `/slots reset`) the weekly pace is the share of budget left over the share of time left, with the linear quota. Working hours are kept through resets and plan changes.
+- `/slots` shows the weekly rate per working hour and the hours a day it projects over.
+
 ## 0.6.2-beta.1
 
 - `/slots` gains subcommands, listed by `/slots help`: `agents N`, `max N`, `auto on|off`, `quantum N`, `reset`, next to `evict`. No checkout needed to change the limits.

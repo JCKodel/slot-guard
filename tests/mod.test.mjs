@@ -352,10 +352,12 @@ test('a subagent step waiting close to the stall limit is admitted by force',asy
 });
 test('slots shows the recent rate and any overdraft',async()=>{
   const h=harness(async()=>({limits:{agent:1},auto:{enabled:true,cap:3,max:3,target:95,
-    windows:[{kind:'five_hour',percent:26,elapsed:27,rate:3.9,pace:4.8}]},
+    windows:[{kind:'five_hour',percent:26,elapsed:27,rate:3.9,pace:4.8},
+             {kind:'seven_day',percent:9,elapsed:26,rate:2.3,hours:9.8,pace:0.73}]},
     tickets:[{seq:1,state:'granted',session:'s',pid:2,idle:0},{seq:2,state:'granted',session:'s',pid:2,idle:0}]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
   assert.match(r.text,/3.9%\/h lately, pace 4.80/);assert.match(r.text,/1 over the limit/);
+  assert.match(r.text,/2.3%\/h working lately, ~9.8 h\/day working, pace 0.73/);
 });
 
 const rotates=h=>h.calls.filter(c=>c.op==='rotate');

@@ -11,7 +11,8 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import AUTO_STEP, Queue, auto_limit, configure, initialize, local_call, pace, process_identity, recent_rate
+from guard import (ACTIVITY_BUCKET, AUTO_STEP, Queue, auto_limit, configure, duty, initialize, local_call, pace,
+                   process_identity, recent_rate)
 
 
 class QueueTests(unittest.TestCase):
@@ -234,6 +235,34 @@ class AutoLimitTests(unittest.TestCase):
         self.assertIsNone(recent_rate([(5, 0), (10, 600)], 2*H, 'five_hour'))
         self.assertEqual(recent_rate([(10, 0), (10, 900)], 1000, 'five_hour'), 0)
 
+    def test_active_rate_counts_only_working_time(self):
+        H, B = self.H, ACTIVITY_BUCKET
+        # 6% over 3 hours of work spread across 9 hours: 2% per active hour, not 0.67.
+        work = [t for t in range(0, 9*H, B) if t % (3*H) < H]
+        history = [(2, 0), (4, 3*H), (6, 6*H), (8, 9*H - 1)]
+        self.assertAlmostEqual(recent_rate(history, 9*H, 'seven_day', work)*H, 2.0)
+        # Minimum history in active time: two working hours of readings at least.
+        self.assertIsNone(recent_rate([(2, 0), (9, 3*H)], 3*H, 'seven_day', work[:12]))
+        self.assertIsNone(recent_rate(history, 9*H, 'seven_day', []))
+
+    def test_duty_learns_hours_a_day_from_a_prior(self):
+        D, B = 86400, ACTIVITY_BUCKET
+        self.assertAlmostEqual(duty([], None, 10*D), 1/3)
+        # A week of 4 hours a day pulls the 8-hour prior down; a week of 16 pushes it up.
+        four = [d*D + t for d in range(3, 10) for t in range(0, 4*3600, B)]
+        sixteen = [d*D + t for d in range(3, 10) for t in range(0, 16*3600, B)]
+        self.assertAlmostEqual(duty(four, four[0], 10*D)*24, (7*4 + 8)/8, places=1)
+        self.assertAlmostEqual(duty(sixteen, sixteen[0], 10*D)*24, (7*16 + 8)/8, places=1)
+        # A week off: only the prior's 8 hours remain, spread over eight days.
+        self.assertAlmostEqual(duty(four, four[0], 20*D)*24, 1.0)
+
+    def test_weekly_pace_projects_over_working_hours(self):
+        H = self.H
+        # 2.3% per active hour, 9% used, 125 hours left: four agents' worth against 8 hours a day.
+        self.assertLess(pace(9, 125*H, 7*86400, 0, rate=2.3/H, linear=True), 0.5)
+        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=2.3/H, linear=True, duty=1/3), 0.85)
+        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=1.5/H, linear=True, duty=1/3), 1.1)
+
     def test_pace_ignores_expired_and_first_minutes(self):
         self.assertIsNone(pace(10, -1, 5*self.H, 0))
         self.assertIsNone(pace(1, 5*self.H - 600, 5*self.H, 0))
@@ -390,6 +419,23 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.q.windows()[0]['percent'], 1)
         self.assertIn('restart', (Path(self.temp.name)/'auto.log').read_text())
         self.assertEqual(self.q.db.execute('SELECT count(*) FROM usage_log').fetchone()[0], 1)
+
+    def test_working_time_is_recorded_and_outlives_a_reset(self):
+        self.usage(9, 125, kind='seven_day')
+        self.q.operate({'op':'status'})
+        self.assertEqual(self.q.db.execute('SELECT count(*) FROM activity').fetchone()[0], 0)  # Nobody working.
+        self.acquire('a')
+        for _ in range(3):
+            self.now += ACTIVITY_BUCKET
+            self.q.reap()  # Every coordinator call reaps first, heartbeats included.
+            self.q.operate({'op':'touch','keys':['a'],'pid':10,'birth':'b'})
+        self.assertEqual(self.q.db.execute('SELECT count(*) FROM activity').fetchone()[0], 3)
+        self.q.operate({'op':'reset','usage':True})
+        self.assertEqual(self.q.db.execute('SELECT count(*) FROM activity').fetchone()[0], 3)
+        self.usage(9, 125, kind='seven_day')
+        weekly = self.q.windows()[0]
+        self.assertIsNone(weekly['rate'])  # A restarted window waits for two working hours of readings.
+        self.assertGreater(weekly['hours'], 8)
 
     def test_reset_forgets_readings_and_restarts_from_the_normal_limit(self):
         self.usage(41, 128, kind='seven_day'); self.usage(95, 1)
