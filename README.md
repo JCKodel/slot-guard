@@ -93,7 +93,7 @@ python3 guard.py configure --auto on
 python3 guard.py status                 # limit, maximum, and each window's usage, elapsed time and pace
 ```
 
-`/slots` shows the same, and the statusline marks it: `Agents ■■ 2/2 (auto, normal 3)`, or `Agents ⏸ paused until 14:05 (usage limit near)`. `/slots reset` or `/slots auto off` ends a pause at once. Any configuration change applies at once: the automatic limit restarts from the new normal limit instead of climbing to it one slot per 10 minutes.
+`/slots` shows the same, and the statusline marks it: `Agents ■■ 2/3 (auto)` while the automatic limit equals the normal one, `Agents ■■ 2/2 (auto, normal 3)` once it moves, or `Agents ⏸ paused until 14:05 (usage limit near)`. `/slots reset` or `/slots auto off` ends a pause at once. Any configuration change applies at once: the automatic limit restarts from the new normal limit instead of climbing to it one slot per 10 minutes.
 
 ### Subagents and the 10-minute stall limit
 
@@ -129,7 +129,7 @@ This explicitly updates your Claude `settings.json`, saves the previous statusli
 
 ```text
 [your existing model / project / usage bars]
-Agents ■■■□ 3/4 · ⌛ #2
+Agents ■■■□ 3/4 (auto) · ⌛ #2
 ```
 
 `■` is occupied; `□` is available. The single count includes all working main agents and subagents. `N waiting` counts queued agents on the whole machine; `⌛ #n` is the current session's best queue position. The display is read-only and refreshes every five seconds. It does not split or reformat your existing bars. Slow existing commands have a three-second timeout.

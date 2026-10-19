@@ -45,15 +45,16 @@ def badge(home, session):
             positions[pool] = min(position, positions.get(pool, position))
         cap = limits['agents']
         limit = cap
-        if limits.get('auto', True) and 'effective' in control:
+        auto = limits.get('auto', True)
+        if auto and 'effective' in control:
             limit = max(0, min(max(cap, limits.get('max', cap)), int(control['effective'])))
         if limit == 0:
             until = time.strftime('%H:%M', time.localtime(control.get('until', 0)))
             summary = f'Agents ⏸ paused until {until} (usage limit near)'
         else:
             summary = slot_bar('Agents', used.get('agent', 0), limit)
-        if limit and limit != cap:
-            summary += f' (auto, normal {cap})'
+        if auto and limit:
+            summary += f' (auto, normal {cap})' if limit != cap else ' (auto)'
         if queued.get('agent'):
             summary += f" · {queued['agent']} waiting"  # Machine-wide, all sessions.
         waiting = ' · '.join('⌛ #' + str(n) for p,n in positions.items() if p == 'agent')

@@ -23,8 +23,8 @@ class PackagingTests(unittest.TestCase):
             owner = {'pid':os.getpid(), 'birth':process_identity(os.getpid())}
             for key, session in (('a','s1'), ('b','s2'), ('c','s1')):
                 local_call(home, {'op':'acquire','key':key,'pool':'agent','session':session,'turn':key,**owner})
-            self.assertEqual(badge(home,'s1'), 'Agents ■ 1/1 · 2 waiting · ⌛ #2')
-            self.assertEqual(badge(home,'s3'), 'Agents ■ 1/1 · 2 waiting')
+            self.assertEqual(badge(home,'s1'), 'Agents ■ 1/1 (auto) · 2 waiting · ⌛ #2')
+            self.assertEqual(badge(home,'s3'), 'Agents ■ 1/1 (auto) · 2 waiting')
 
     def test_badge_shows_the_sessions_best_queue_position(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,7 +50,7 @@ class PackagingTests(unittest.TestCase):
             for key, state in (('a', 'granted'), ('b', 'queued')):
                 db.execute("INSERT INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES(?,'agent','s','t',1,'b',?,0)", (key, state))
             db.commit(); db.close()
-            self.assertEqual(badge(home, 's'), 'Agents ■□ 1/2 · 1 waiting · ⌛ #1')
+            self.assertEqual(badge(home, 's'), 'Agents ■□ 1/2 (auto) · 1 waiting · ⌛ #1')
 
     def test_badge_shows_automatic_limit_below_maximum(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -78,7 +78,7 @@ class PackagingTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
             initialize(home, 4)
             self.assertEqual(local_call(home, {'op':'status'})['limits'], {'agent':2})
-            self.assertEqual(badge(home,''), 'Agents □□ 0/2')
+            self.assertEqual(badge(home,''), 'Agents □□ 0/2 (auto)')
             (home/'config.json').unlink()
             with self.assertRaisesRegex(RuntimeError, 'Missing configuration'):
                 initialize(home,4)
@@ -95,7 +95,7 @@ class PackagingTests(unittest.TestCase):
             result = subprocess.run(data['statusLine']['command'],shell=True,input='{}',text=True,capture_output=True,
                                     env={**test_environment(),'CLAUDE_SLOT_HOME':str(state)})
             self.assertEqual(result.returncode,0,result.stderr)
-            self.assertEqual(result.stdout, 'existing line 1\nexisting line 2\nAgents □□ 0/2\n')
+            self.assertEqual(result.stdout, 'existing line 1\nexisting line 2\nAgents □□ 0/2 (auto)\n')
             data['other'] = 'new'; settings.write_text(json.dumps(data))
             setup(config,runtime,remove=True)
             self.assertEqual(json.loads(settings.read_text()), {'statusLine':previous,'other':'new'})
