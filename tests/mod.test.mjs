@@ -183,6 +183,20 @@ test('slots command evicts by ticket number',async()=>{
   assert.deepEqual(h.calls.at(-1),{op:'evict',seqs:[12,13]});assert.match(r.text,/2 ticket/);
   assert.match((await h.handlers['command.run'](h.$,{command:'slots',args:'evict x'})).text,/Usage/);
 });
+test('slots sprint starts this session or every session, and ends on off',async()=>{
+  const status={limits:{agent:3},auto:{enabled:false},sprints:{},tickets:[]};
+  const h=harness(async d=>d.op==='sprint'?{sprints:d.minutes?{[d.session]:1000+60*d.minutes}:{}}:
+    {...status,sprints:{session:1300},tickets:[1,2,3,4].map(n=>({seq:n,state:'granted',session:'session',pid:1,idle:0}))});
+  let r=await h.handlers['command.run'](h.$,{command:'slots',args:'sprint'});
+  assert.deepEqual(h.calls.at(-2),{op:'sprint',session:'session',minutes:5});
+  assert.match(r.text,/sprint for this session until/);assert.match(r.text,/Sprint: session session starts/);assert.match(r.text,/1 over the limit: a sprint/);
+  await h.handlers['command.run'](h.$,{command:'slots',args:'sprint all 15'});
+  assert.deepEqual(h.calls.at(-2),{op:'sprint',session:'*',minutes:15});
+  r=await h.handlers['command.run'](h.$,{command:'slots',args:'sprint off'});
+  assert.deepEqual(h.calls.at(-2),{op:'sprint',session:'session',minutes:0});assert.match(r.text,/sprints ended/);
+  for(const args of ['sprint 0','sprint 61','sprint all off','sprint 5 5','sprint x'])
+    assert.match((await h.handlers['command.run'](h.$,{command:'slots',args})).text,/Usage: \/slots sprint/);
+});
 test('slots subcommands configure and reset, with help on misuse',async()=>{
   const status={limits:{agent:5},auto:{enabled:true,cap:5,max:5,target:95,windows:[]},tickets:[]};
   const h=harness(async d=>d.op==='configure'?{config:{agents:5,auto:true,schema:2},...status}:d.op==='reset'?{limit:5}:status);
@@ -190,6 +204,9 @@ test('slots subcommands configure and reset, with help on misuse',async()=>{
   assert.deepEqual(h.calls.at(-1),{op:'configure',agents:5});assert.match(r.text,/agents set to 5, applied now\.\nAgents: 0\/5 working/);
   r=await h.handlers['command.run'](h.$,{command:'slots',args:'max 2'});
   assert.deepEqual(h.calls.at(-1),{op:'configure',max:2});assert.match(r.text,/is the normal limit itself/);
+  const off=harness(async d=>d.op==='configure'?{config:{agents:5,max:10,auto:false,schema:2},...status}:status);
+  r=await off.handlers['command.run'](off.$,{command:'slots',args:'max 10'});
+  assert.match(r.text,/max set to 10, saved\.\nThe automatic limit is off, so the maximum has no effect: the limit stays at 5/);
   r=await h.handlers['command.run'](h.$,{command:'slots',args:'auto off'});
   assert.deepEqual(h.calls.at(-1),{op:'configure',auto:false});
   r=await h.handlers['command.run'](h.$,{command:'slots',args:'quantum 90'});

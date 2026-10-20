@@ -511,6 +511,47 @@ class AutoQueueTests(unittest.TestCase):
     def ticket(self, key, **extra):
         return {'op':'acquire','key':key,'pool':'agent','session':'s','turn':key,'pid':10,'birth':'b', **extra}
 
+    def test_sprint_starts_one_sessions_agents_over_the_limit_until_it_ends(self):
+        for k in 'abc': self.q.operate(self.ticket(k))
+        self.assertEqual(self.q.operate(self.ticket('u', session='urgent'))['state'], 'queued')
+        until = self.q.operate({'op':'sprint','session':'urgent','minutes':5})['sprints']['urgent']
+        self.assertEqual(until, self.now + 300)
+        self.assertEqual(self.state_of('u'), 'granted')
+        self.assertEqual(self.q.operate(self.ticket('u2', session='urgent'))['state'], 'granted')
+        self.q.operate({'op':'release','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'})
+        self.assertEqual(self.q.operate(self.ticket('other'))['state'], 'queued')  # The sprint counts.
+        self.age_grant('u', 120)
+        self.assertEqual(self.q.operate(self.ticket('u', session='urgent', rotate=True))['state'], 'granted')
+        self.assertEqual(self.q.operate({'op':'status'})['sprints'], {'urgent': self.now + 300})
+        self.now += 301
+        self.assertEqual(self.q.operate({'op':'status'})['sprints'], {})
+        self.assertEqual(self.q.operate(self.ticket('u3', session='urgent'))['state'], 'queued')
+        self.assertEqual(self.q.operate(self.ticket('u', session='urgent', rotate=True))['state'], 'queued')
+
+    def test_a_free_slot_goes_to_the_sprint_before_the_queue(self):
+        for k in 'ab': self.q.operate(self.ticket(k))
+        # Both wait for the one free slot, x first in line, when the sprint starts.
+        self.q.db.execute("INSERT INTO tickets(key,pool,session,turn,pid,birth,state,created) VALUES "
+                          "('x','agent','s','x',10,'b','queued',1),('u','agent','urgent','u',10,'b','queued',2)")
+        self.q.db.commit()
+        self.q.operate({'op':'sprint','session':'urgent','minutes':5})
+        self.assertEqual((self.state_of('u'), self.state_of('x')), ('granted', 'queued'))
+        self.assertEqual(self.q.db.execute("SELECT count(*) FROM tickets WHERE state='granted'").fetchone()[0], 3)
+
+    def test_sprint_for_every_session_ends_on_off_and_never_during_a_pause(self):
+        for k in 'abc': self.q.operate(self.ticket(k))
+        self.q.operate({'op':'sprint','session':'*','minutes':5})
+        self.assertEqual(self.q.operate(self.ticket('d'))['state'], 'granted')
+        self.q.operate({'op':'sprint','session':'*','minutes':0})
+        self.assertEqual(self.q.operate(self.ticket('e'))['state'], 'queued')
+        self.q.operate({'op':'sprint','session':'*','minutes':5})
+        self.usage(96, 1)
+        self.assertEqual(self.q.operate(self.ticket('f'))['state'], 'queued')
+        self.assertEqual(self.state_of('d'), 'queued')
+        for bad in (-1, 61, 1.5, None):
+            with self.assertRaises(ValueError):
+                self.q.operate({'op':'sprint','session':'s','minutes':bad})
+
     def test_work_under_way_goes_before_new_prompts(self):
         for k in 'abc': self.q.operate(self.ticket(k))
         self.assertEqual(self.q.operate(self.ticket('new'))['position'], 1)

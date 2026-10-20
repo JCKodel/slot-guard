@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.6-beta.1
+
+- `/slots sprint [all] [M]` for urgent work: for M minutes (default 5, up to 60) the agents of this session, or of every session with `all`, start at once and are not rotated out, over the limit. They still count, so other sessions start nothing new until the pool drains under the limit. A pause near a usage window's limit stops a sprint too. `/slots sprint off` ends every sprint; `/slots` shows the ones running.
+- `/slots max N` with the automatic limit off says the maximum was saved but has no effect, instead of "applied now" with the limit unchanged; with it on, it says the limit climbs one slot per 10 minutes, and only while every window has plenty left.
+
 ## 0.6.5-beta.1
 
 - After a pause the automatic limit settles at once. When no agent has worked for an hour (a night, a long break), the first coordinator call takes every step the current readings call for, up or down, instead of one slot per 10 minutes from where the evening left it: a morning after a limit of 1 started at 1 and needed 40 minutes to reach 5 although the weekly pace allowed 5 from the first call. While agents work the limit still moves one slot per 10 minutes.

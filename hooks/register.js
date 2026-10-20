@@ -8,6 +8,7 @@ const PARK_MS=60000;       // A parent's slot left for its subagent goes back to
 // from the step's start; one waiting this long is admitted over the limit instead (never
 // during a pause), leaving the model three minutes for its first chunk.
 const FORCE_MS=420000;
+const SPRINT_MINUTES=5;    // Default length of "/slots sprint".
 const instance=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10);
 const emptyStep = e => ({turnId:e.turnId,index:e.index,answer:'',toolUses:[],stopReason:null,usage:null});
 async function call($, data) {
@@ -204,6 +205,8 @@ const HELP=[
   '/slots quantum N       Seconds an agent keeps its slot while others wait (default 60).',
   '/slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a pause now.',
   '/slots evict N [N...]  Release ticket N by hand (numbers as listed by /slots).',
+  `/slots sprint [all] [M] Urgent work: this session's agents (all: every session's) start at once, over the limit, for M minutes (default ${SPRINT_MINUTES}, up to 60). The others wait until it drains; a pause still stops it.`,
+  '/slots sprint off      End every sprint now.',
   '/slots help            This text.',
   '',
   'Changes apply to every session at once; running work finishes and the queue drains to the new limit.',
@@ -217,8 +220,11 @@ async function status($,s) {
     [`Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots reset" or "/slots auto off" resumes now.`] : [];
   const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
     (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
+  const sprints=Object.entries(s.sprints||{});
+  for(const [session,until] of sprints)
+    auto.push(`Sprint: ${session==='*'?'every session':'session '+session.slice(0,8)} starts its agents at once until ${new Date(until*1000).toLocaleTimeString()}. "/slots sprint off" ends it.`);
   const over=count('granted')-s.limits.agent;
-  if(over>0) auto.push(`${over} over the limit: subagents admitted before Claude Code's 10-minute stall limit; nothing new starts until they finish.`);
+  if(over>0) auto.push(`${over} over the limit: ${sprints.length?'a sprint, or ':''}subagents admitted before Claude Code's 10-minute stall limit; nothing new starts until they finish.`);
   return [`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot. "/slots help" lists the subcommands.`,...auto,...lines].join('\n');
 }
 export function register(on) {
@@ -232,7 +238,7 @@ export function register(on) {
   let timer=null;
   on('session.start',async($,e,next)=>{
     await $.command.register({name:'slots',description:'Show or change the global working-agent limit and FIFO queue; "/slots help" lists the subcommands.',
-      argumentHint:'[help | agents N | max N | auto on|off | quantum N | reset | evict N...]',immediate:true});
+      argumentHint:'[help | agents N | max N | auto on|off | quantum N | sprint [all] [M] | sprint off | reset | evict N...]',immediate:true});
     if(!timer) {
       // Tickets a previous load of this mod held in this process can no longer be released by it.
       await call($,{op:'adopt',instance}).catch(()=>{});
@@ -258,6 +264,19 @@ export function register(on) {
         const r=await call($,{op:'evict',seqs});
         return {text:`Slot Guard: ${r.evicted} ticket(s) released.`};
       }
+      if(verb==='sprint') {
+        const all=rest[0]==='all', args=all ? rest.slice(1) : rest;
+        const off=!all && args.length===1 && args[0]==='off';
+        const minutes=off ? 0 : args.length ? Number(args[0]) : SPRINT_MINUTES;
+        if(args.length>1 || !off && !(Number.isInteger(minutes) && minutes>=1 && minutes<=60))
+          return {text:'Usage: /slots sprint [all] [minutes] | /slots sprint off\n\n'+HELP};
+        const session=all ? '*' : await $.session.id();
+        const r=await call($,{op:'sprint',session,minutes});
+        const text=off ? 'Slot Guard: sprints ended; agents queue under the limit again.' :
+          `Slot Guard: sprint for ${all?'every session':'this session'} until ${new Date(r.sprints[session]*1000).toLocaleTimeString()}: `+
+          'its agents start at once, over the limit; the others wait until it drains. A pause near a usage window\'s limit still stops it.';
+        return {text:text+'\n'+await status($)};
+      }
       if(verb==='reset') {
         if(rest.length) return {text:'Usage: /slots reset\n\n'+HELP};
         const r=await call($,{op:'reset',usage:true});
@@ -269,9 +288,13 @@ export function register(on) {
         if(!valid) return {text:`Usage: /slots ${verb} ${verb==='auto'?'on|off':'N'}\n\n`+HELP};
         const r=await call($,{op:'configure',[verb]:value});
         const notes=[];
-        if(verb==='max' && !r.config.max) notes.push(`A maximum at or under the normal limit (${r.config.agents}) is the normal limit itself; raise "agents" instead.`);
+        // The maximum only bounds the automatic limit: with it off, nothing changes now.
+        const idle=verb==='max' && !r.config.auto;
+        if(idle) notes.push(`The automatic limit is off, so the maximum has no effect: the limit stays at ${r.config.agents}. Use "/slots agents N" for a fixed limit, or "/slots auto on".`);
+        else if(verb==='max' && !r.config.max) notes.push(`A maximum at or under the normal limit (${r.config.agents}) is the normal limit itself; raise "agents" instead.`);
+        else if(verb==='max') notes.push(`Above ${r.config.agents} the limit rises one slot every 10 minutes, and only while every usage window has plenty left.`);
         if(verb==='agents' && !r.config.auto) notes.push('The automatic limit is off: this is a fixed limit.');
-        return {text:[`Slot Guard: ${verb} set to ${verb==='auto'?rest[0]:value}, applied now.`,...notes,await status($,r)].join('\n')};
+        return {text:[`Slot Guard: ${verb} set to ${verb==='auto'?rest[0]:value}, ${idle?'saved':'applied now'}.`,...notes,await status($,r)].join('\n')};
       }
       return {text:(verb==='help' ? '' : `Unknown subcommand "${verb}".\n\n`)+HELP};
     } catch(error) {return {text:'Slot Guard: '+String(error)};}

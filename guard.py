@@ -25,6 +25,7 @@ DEFAULT_AGENTS = 3  # Lasts a 5-hour window on Claude Max 5x; see README.
 LEASE = 300  # Seconds without renewal before a heartbeating ticket is abandoned.
 QUANTUM = 60  # Seconds an agent keeps its slot before yielding it to one that waits.
 AGING = 300  # Seconds in line after which a ticket gets the priority of work under way.
+SPRINT_MAX = 60  # Minutes a sprint may last.
 TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
 LIVE = "state IN ('queued','granted')"
 # Automatic limit: keep each usage window on pace to end at AUTO_TARGET percent,
@@ -271,6 +272,8 @@ class Queue:
         # Start times of ACTIVITY_BUCKETs with an agent working; kept through resets and plan
         # changes, which restart the usage windows but not the user's working hours.
         self.db.execute('CREATE TABLE IF NOT EXISTS activity (bucket INTEGER PRIMARY KEY)')
+        # Sessions ('*': every session) whose agents start at once, over the limit, until `until`.
+        self.db.execute('CREATE TABLE IF NOT EXISTS sprints (session TEXT PRIMARY KEY, until REAL NOT NULL)')
         if 'rank' not in columns:
             # 0: work already under way (subagents, resumptions) goes before new prompts (1).
             self.db.execute('ALTER TABLE tickets ADD COLUMN rank INTEGER NOT NULL DEFAULT 1')
@@ -301,6 +304,7 @@ class Queue:
                     AND instance!='' AND coalesce(touched,created)<?""", (now, now - self.lease))
             self.db.execute("DELETE FROM tickets WHERE state='released' AND coalesce(touched,created)<?",
                             (now - TOMBSTONE,))
+            self.db.execute('DELETE FROM sprints WHERE until<=?', (self.clock(),))
             self._promote()
 
     def windows(self):
@@ -375,8 +379,17 @@ class Queue:
         self.limits['agent'] = limit
         self.until = until
 
+    def sprints(self):
+        """Live sprints as {session: until}."""
+        return dict(self.db.execute('SELECT session,until FROM sprints WHERE until>?', (self.clock(),)))
+
+    def _sprinting(self, session):
+        sprints = self.sprints()
+        return '*' in sprints or session in sprints
+
     def _promote(self):
         self._control()
+        sprints = self.sprints()
         for pool, limit in self.limits.items():
             if limit == 0:
                 # Working agents wait at their next step or tool, keeping their FIFO places.
@@ -384,6 +397,12 @@ class Queue:
             # Aging: no prompt or rotated agent waits behind an endless stream of new subagents.
             self.db.execute("""UPDATE tickets SET rank=0 WHERE pool=? AND state='queued' AND rank=1
                 AND coalesce(waited, created) <= ?""", (pool, time.time() - AGING))
+            if limit > 0 and sprints:
+                # Urgent work starts at once, over the limit, and first: it takes any free slot,
+                # so nothing new starts elsewhere until it drains. A pause stops a sprint too.
+                self.db.execute(f"""UPDATE tickets SET state='granted', since=? WHERE pool=? AND state='queued'
+                    AND (? OR session IN ({','.join('?' * len(sprints))}))""",
+                    (time.time(), pool, '*' in sprints, *sprints))
             used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (pool,)).fetchone()[0]
             free = max(0, limit - used)
             self.db.execute("""UPDATE tickets SET state='granted', since=? WHERE seq IN
@@ -397,8 +416,8 @@ class Queue:
         agent's first grant of a turn still goes first). Nothing happens when no one waits.
         The caller must only rotate an agent between model calls.
         """
-        row = self.db.execute('SELECT seq,pool,since FROM tickets WHERE key=? AND state=?', (key, 'granted')).fetchone()
-        if not row or row['since'] is None or now - row['since'] < self.quantum:
+        row = self.db.execute('SELECT seq,pool,session,since FROM tickets WHERE key=? AND state=?', (key, 'granted')).fetchone()
+        if not row or row['since'] is None or now - row['since'] < self.quantum or self._sprinting(row['session']):
             return False
         if not self.db.execute("SELECT 1 FROM tickets WHERE pool=? AND state='queued' AND key!=?",
                                (row['pool'], key)).fetchone():
@@ -439,6 +458,7 @@ class Queue:
             return {'limits': self.limits, 'lease': self.lease,
                     'auto': {'enabled': self.auto, 'cap': self.cap, 'max': self.ceiling, 'target': AUTO_TARGET, 'until': self.until,
                              'windows': self.windows()} if self.auto else {'enabled': False},
+                    'sprints': self.sprints(),
                     'tickets': [
                 {**dict(r), 'idle': round(now - r['seen'])} for r in self.db.execute(
                     f"""SELECT seq,pool,session,turn,pid,state,coalesce(touched,created) AS seen
@@ -465,6 +485,22 @@ class Queue:
                     self.db.execute('DELETE FROM usage_log')
                 self._promote()
             return {'limit': self.limits['agent']}
+        if op == 'sprint':
+            # Urgent work: the agents of one session ('*': all) start at once for `minutes`;
+            # 0 ends every sprint.
+            session, minutes = data.get('session'), data.get('minutes')
+            if not isinstance(session, str) or not 0 < len(session) <= 512:
+                raise ValueError('Invalid session')
+            if type(minutes) is not int or not 0 <= minutes <= SPRINT_MAX:
+                raise ValueError(f'Sprint minutes must be 0 to {SPRINT_MAX}')
+            with self.db:
+                if minutes:
+                    self.db.execute('INSERT OR REPLACE INTO sprints VALUES (?,?)', (session, self.clock() + 60 * minutes))
+                else:
+                    self.db.execute('DELETE FROM sprints')
+                self.note({'at': self.clock(), 'sprint': session, 'minutes': minutes})
+                self._promote()
+            return {'sprints': self.sprints()}
         if op == 'usage':
             readings = data.get('readings')
             if not isinstance(readings, list) or len(readings) > 8:
@@ -739,7 +775,7 @@ def main():
         if data.get('op') == 'configure':
             print(json.dumps(configure(args.home, data)))
             return
-        if data.get('op') not in ('status', 'evict', 'reset'):
+        if data.get('op') not in ('status', 'evict', 'reset', 'sprint'):
             data.update(claude_owner())
         print(json.dumps(local_call(args.home, data)))
 

@@ -43,7 +43,13 @@ Everything can be changed from inside Claude Code with one command and its subco
 /slots quantum N       Seconds an agent keeps its slot while others wait (default 60).
 /slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a pause now.
 /slots evict N [N...]  Release ticket N by hand (numbers as listed by /slots).
+/slots sprint [all] [M] Urgent work: this session's agents (all: every session's) start at once, over the limit, for M minutes (default 5, up to 60). The others wait until it drains; a pause still stops it.
+/slots sprint off      End every sprint now.
 ```
+
+A sprint follows the session ID: `/clear` starts a new session, outside the sprint.
+
+`/slots max` only bounds the automatic limit: with `auto off` it is kept but has no effect, and the limit is `agents`.
 
 The same is available from a checkout, which the optional statusline installation also needs:
 
