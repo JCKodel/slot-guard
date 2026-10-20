@@ -203,7 +203,8 @@ test('slots subcommands configure and reset, with help on misuse',async()=>{
   let r=await h.handlers['command.run'](h.$,{command:'slots',args:'agents 5'});
   assert.deepEqual(h.calls.at(-1),{op:'configure',agents:5});assert.match(r.text,/agents set to 5, applied now\.\nAgents: 0\/5 working/);
   r=await h.handlers['command.run'](h.$,{command:'slots',args:'max 2'});
-  assert.deepEqual(h.calls.at(-1),{op:'configure',max:2});assert.match(r.text,/is the normal limit itself/);
+  assert.deepEqual(h.calls.at(-1),{op:'configure',max:2});assert.match(r.text,/^Slot Guard: max 2 is not above the normal limit \(5\): no maximum is set\.\n.*still goes up to 5\. To lower it, use "\/slots agents 2"/);
+  assert.doesNotMatch(r.text,/applied now/);
   const off=harness(async d=>d.op==='configure'?{config:{agents:5,max:10,auto:false,schema:2},...status}:status);
   r=await off.handlers['command.run'](off.$,{command:'slots',args:'max 10'});
   assert.match(r.text,/max set to 10, saved\.\nThe automatic limit is off, so the maximum has no effect: the limit stays at 5/);

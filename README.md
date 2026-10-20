@@ -37,8 +37,8 @@ Everything can be changed from inside Claude Code with one command and its subco
 
 ```
 /slots                 Show the limit, who is working and who waits (FIFO).
-/slots agents N        Set the normal limit to N agents, applied now.
-/slots max N           With the automatic limit, allow up to N agents while every usage window has plenty left.
+/slots agents N        Set the normal limit to N agents, applied now. The automatic limit stays at or under it, unless "max" allows more.
+/slots max N           Extra room above "agents": with the automatic limit, up to N agents while every usage window has plenty left. N must be above "agents"; to lower the limit, lower "agents".
 /slots auto on|off     Pace the limit by the usage windows (on), or keep it fixed at "agents" (off).
 /slots quantum N       Seconds an agent keeps its slot while others wait (default 60).
 /slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a pause now.
@@ -49,7 +49,7 @@ Everything can be changed from inside Claude Code with one command and its subco
 
 A sprint follows the session ID: `/clear` starts a new session, outside the sprint.
 
-`/slots max` only bounds the automatic limit: with `auto off` it is kept but has no effect, and the limit is `agents`.
+`agents` is the limit you normally get; `max` is only extra room above it, never a lower ceiling. To run at most 5 agents, use `/slots agents 5`: `/slots max 5` with `agents` at 10 sets no maximum, and the limit still goes up to 10. A `max` at or under `agents` removes any maximum, and lowering `agents` to or past the maximum removes it too. `max` only bounds the automatic limit: with `auto off` it is kept but has no effect, and the limit is `agents`.
 
 The same is available from a checkout, which the optional statusline installation also needs:
 

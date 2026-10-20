@@ -199,8 +199,8 @@ const HELP=[
   'Slot Guard: one machine-wide limit on working agents (main agents and subagents, every terminal).',
   '',
   '/slots                 Show the limit, who is working and who waits (FIFO).',
-  '/slots agents N        Set the normal limit to N agents, applied now; with the automatic limit it is the usual maximum.',
-  '/slots max N           With the automatic limit, allow up to N agents while every usage window has plenty left.',
+  '/slots agents N        Set the normal limit to N agents, applied now. The automatic limit stays at or under it, unless "max" allows more.',
+  '/slots max N           Extra room above "agents": with the automatic limit, up to N agents while every usage window has plenty left. N must be above "agents"; to lower the limit, lower "agents".',
   '/slots auto on|off     Pace the limit by the usage windows (on), or keep it fixed at "agents" (off).',
   '/slots quantum N       Seconds an agent keeps its slot while others wait (default 60).',
   '/slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a pause now.',
@@ -290,11 +290,15 @@ export function register(on) {
         const notes=[];
         // The maximum only bounds the automatic limit: with it off, nothing changes now.
         const idle=verb==='max' && !r.config.auto;
+        // The coordinator keeps a maximum only above the normal limit; anything else removes it.
+        const below=verb==='max' && !idle && !r.config.max;
         if(idle) notes.push(`The automatic limit is off, so the maximum has no effect: the limit stays at ${r.config.agents}. Use "/slots agents N" for a fixed limit, or "/slots auto on".`);
-        else if(verb==='max' && !r.config.max) notes.push(`A maximum at or under the normal limit (${r.config.agents}) is the normal limit itself; raise "agents" instead.`);
+        else if(below) notes.push(`The maximum only adds room above the normal limit, so the limit still goes up to ${r.config.agents}. To lower it, use "/slots agents ${value}".`);
         else if(verb==='max') notes.push(`Above ${r.config.agents} the limit rises one slot every 10 minutes, and only while every usage window has plenty left.`);
         if(verb==='agents' && !r.config.auto) notes.push('The automatic limit is off: this is a fixed limit.');
-        return {text:[`Slot Guard: ${verb} set to ${verb==='auto'?rest[0]:value}, ${idle?'saved':'applied now'}.`,...notes,await status($,r)].join('\n')};
+        const head=below ? `Slot Guard: max ${value} is not above the normal limit (${r.config.agents}): no maximum is set.` :
+          `Slot Guard: ${verb} set to ${verb==='auto'?rest[0]:value}, ${idle?'saved':'applied now'}.`;
+        return {text:[head,...notes,await status($,r)].join('\n')};
       }
       return {text:(verb==='help' ? '' : `Unknown subcommand "${verb}".\n\n`)+HELP};
     } catch(error) {return {text:'Slot Guard: '+String(error)};}

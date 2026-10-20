@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.7-beta.1
+
+- `/slots max N` at or under the normal limit no longer says "max set to N, applied now": it says no maximum is set, that the limit still goes up to `agents`, and suggests `/slots agents N` to lower it. `/slots help` and the README explain that `max` is only extra room above `agents`, never a lower ceiling.
+
 ## 0.6.6-beta.1
 
 - `/slots sprint [all] [M]` for urgent work: for M minutes (default 5, up to 60) the agents of this session, or of every session with `all`, start at once and are not rotated out, over the limit. They still count, so other sessions start nothing new until the pool drains under the limit. A pause near a usage window's limit stops a sprint too. `/slots sprint off` ends every sprint; `/slots` shows the ones running.
