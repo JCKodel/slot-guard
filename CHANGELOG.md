@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.5-beta.1
+
+- After a pause the automatic limit settles at once. When no agent has worked for an hour (a night, a long break), the first coordinator call takes every step the current readings call for, up or down, instead of one slot per 10 minutes from where the evening left it: a morning after a limit of 1 started at 1 and needed 40 minutes to reach 5 although the weekly pace allowed 5 from the first call. While agents work the limit still moves one slot per 10 minutes.
+
 ## 0.6.4-beta.1
 
 - The statusline shows `(auto)` whenever the automatic limit is on. It used to mark it only once the limit moved from the normal one, so right after `/slots auto on` (which restarts from the normal limit) it looked the same as a fixed limit.

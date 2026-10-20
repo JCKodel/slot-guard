@@ -437,6 +437,37 @@ class AutoQueueTests(unittest.TestCase):
         self.assertIsNone(weekly['rate'])  # A restarted window waits for two working hours of readings.
         self.assertGreater(weekly['hours'], 8)
 
+    def after_working(self, ago, limit):
+        """The limit `limit`, last changed and last worked `ago` seconds before now."""
+        bucket = int((self.now - ago) // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
+        self.q.db.execute('INSERT INTO activity VALUES (?)', (bucket,))
+        self.q.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, self.now - ago))
+        self.q.db.commit()
+
+    def test_after_a_night_the_limit_settles_at_once(self):
+        self.after_working(14*self.H, 1)
+        resets = self.now + 104*self.H
+        weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
+        self.assertEqual(weekly(18)['limit'], 3)  # On pace: straight to normal.
+        self.assertEqual(self.acquire('a'), 'granted')
+        self.q.reap()  # The next call (a heartbeat) marks the work: back to one step at a time.
+        self.now += AUTO_STEP
+        self.assertEqual(weekly(60)['limit'], 2)
+
+    def test_after_a_night_far_ahead_settles_down_at_once(self):
+        self.after_working(14*self.H, 3)
+        self.assertEqual(self.usage(90, 72, kind='seven_day')['limit'], 1)
+
+    def test_the_first_working_call_after_a_night_still_settles(self):
+        self.after_working(14*self.H, 1)
+        self.q.db.execute("INSERT INTO tickets (key,pool,session,turn,pid,birth,state,created) "
+                          "VALUES ('a','agent','s','a',10,'b','granted',?)", (self.now,))
+        self.assertEqual(self.usage(18, 104, kind='seven_day')['limit'], 3)
+
+    def test_without_a_pause_the_limit_moves_one_step(self):
+        self.after_working(AUTO_STEP, 1)
+        self.assertEqual(self.usage(18, 104, kind='seven_day')['limit'], 2)
+
     def test_reset_forgets_readings_and_restarts_from_the_normal_limit(self):
         self.usage(41, 128, kind='seven_day'); self.usage(95, 1)
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 0)

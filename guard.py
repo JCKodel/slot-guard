@@ -33,6 +33,7 @@ WINDOWS = {'five_hour': 5 * 3600, 'seven_day': 7 * 86400}
 AUTO_TARGET = 95.0
 AUTO_STEP = 600     # Seconds between changes of one slot.
 AUTO_WARMUP = 900   # Seconds: a window's first minutes are too noisy to act on.
+AUTO_IDLE = 3600    # Seconds without an agent working (a night): settle at once, not a step at a time.
 # Per window: below `low` the window votes a slot down (not under `floor`); above `high` it
 # lets the limit rise. The weekly window only acts at twice the pace and keeps two agents.
 AUTO_BOOST = (1.1, 1.25)  # Above the normal limit: rise only past 1.25 everywhere, return under 1.1.
@@ -337,6 +338,8 @@ class Queue:
     def _control(self):
         """Set the effective limit; with auto off it is the configured one."""
         value = dict(self.db.execute('SELECT name,value FROM control'))
+        # Read before this call marks its own bucket, or the first call after a pause hides it.
+        last = self.db.execute('SELECT max(bucket) FROM activity').fetchone()[0]
         if self.db.execute("SELECT 1 FROM tickets WHERE state='granted' LIMIT 1").fetchone():
             # Heartbeats renew granted tickets every 30 s, so working time marks every bucket.
             bucket = int(self.clock() // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
@@ -356,6 +359,14 @@ class Queue:
                 if previous == 0:
                     previous = self.cap  # A renewed window starts again from the maximum.
                 limit, changed = auto_limit(previous, self.cap, signals, now, value.get('changed', 0), self.ceiling)
+                if last is not None and now - last >= ACTIVITY_BUCKET + AUTO_IDLE:
+                    # After a pause the readings already say where the limit belongs: the steps
+                    # it would have taken meanwhile are taken now, in either direction.
+                    for _ in range(self.ceiling):
+                        step, _ = auto_limit(limit, self.cap, signals, now, now - AUTO_STEP, self.ceiling)
+                        if step == limit:
+                            break
+                        limit, changed = step, now
             if limit != previous:
                 self.note({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
                            'paces': {k: round(p, 2) for k, p in signals}})
