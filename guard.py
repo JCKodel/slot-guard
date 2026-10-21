@@ -37,15 +37,17 @@ AUTO_WARMUP = 900   # Seconds: a window's first minutes are too noisy to act on.
 AUTO_IDLE = 3600    # Seconds without an agent working (a night): settle at once, not a step at a time.
 # Per window: below `low` the window votes a slot down, not under `floor` nor under the
 # normal limit times its pace (a window 15% too fast needs 15% fewer agents, not one);
-# above `high` it lets the limit rise. The weekly window, judged over days, acts later,
-# and keeps `under_line` agents while its usage is under the linear quota.
+# above `high` it lets the limit rise. The weekly window, judged over days, acts later.
+# `line` is the linear quota of a LINEAR window, judged by line_pace.
 AUTO_BOOST = (1.1, 1.25)  # Above the normal limit: rise only past 1.25 everywhere, return under 1.1.
 AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
-               'seven_day': {'low': 0.75, 'high': 1.1, 'floor': 1, 'under_line': 2}}
-# Windows also held to a linear quota: used share no higher than elapsed share (1/7 a day
-# for the weekly one), so a fast start cannot borrow from the rest of the week.
+               'seven_day': {'low': 0.75, 'high': 1.1, 'floor': 1},
+               'line': {'low': 1.0, 'high': 1.1, 'floor': 1}}
+# Windows also held to a linear quota: used share never above elapsed share (1/7 a day
+# for the weekly one), so a fast start cannot borrow from the rest of the week. A reading
+# over the line pauses every agent until the line reaches it; near it, the limit is cut.
 LINEAR = {'seven_day'}
-LINEAR_SLACK = 1.0  # Percent: readings come in whole points.
+LINE_HORIZON = 4 * 3600  # Seconds the margin to the line must last at the recent rate.
 # A reading of the same window this many points under the stored one means the account's
 # window started over (a plan change); readings from concurrent responses differ by less.
 # An idle session can still report its last response from hours ago, so the drop only
@@ -96,15 +98,13 @@ def recent_rate(history, now, kind, buckets=None):
     return max(0.0, p1 - p0) / span(t0, now)
 
 
-def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, linear=False, duty=1.0):
+def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, duty=1.0):
     """How sustainable usage is: 1 on pace to end at target, below 1 too fast.
 
     With a recent burn rate: the budget left over what that rate spends in the
     time left, of which only the share `duty` is active (a rate per active
     second). It follows the current load, so the limit recovers once usage
     slows. Without one, the share of budget left over the share of time left.
-    With `linear`, also the elapsed share over the used share: below 1 while
-    usage is above the straight line from 0 to 100% across the window.
     None when the reading cannot be judged: expired, malformed, or too early.
     """
     seconds_left = resets - now
@@ -116,17 +116,34 @@ def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, linear=Fal
         result = budget / (rate * duty * seconds_left) if rate > 0 else float('inf')
     else:
         result = budget / target / left
-    if linear and percent > 0:
-        result = min(result, (100 * (1 - left) + LINEAR_SLACK) / percent)
     return result
 
 
-def auto_limit(current, cap, signals, now, changed, ceiling=None, floors=None):
+def line_pace(percent, resets, length, now, rate):
+    """How long the margin to the linear quota lasts: 1 when the recent rate, kept up
+    nonstop (a night of work included), reaches the line LINE_HORIZON from now; below 1
+    sooner, while the line itself rises 100% per window length. None without a rate."""
+    left = (resets - now) / length
+    if rate is None or not 0 < left <= 1:
+        return None
+    if rate <= 0:
+        return float('inf')
+    margin = 100 * (1 - left) - percent
+    return max(0.0, margin + 100 * LINE_HORIZON / length) / (rate * LINE_HORIZON)
+
+
+def line_until(percent, resets, length, now):
+    """When the linear quota reaches a reading above it; None while the reading is not."""
+    until = resets - length * (1 - percent / 100)
+    return until if until > now else None
+
+
+def auto_limit(current, cap, signals, now, changed, ceiling=None):
     """One slot at most every AUTO_STEP; the normal limit `cap` without data.
 
     signals: (kind, pace) of each judgeable window. Any window below its `low`
     lowers the limit, down to the smallest floor among those windows: its
-    policy floor (or floors[kind]), or `cap` times its pace rounded, if more;
+    policy floor, or `cap` times its pace rounded, if more;
     up to `cap` it rises when every window is above its `high`. Between `cap`
     and `ceiling` every window must be above AUTO_BOOST[1], and the limit
     returns toward `cap` once any falls under AUTO_BOOST[0].
@@ -137,8 +154,7 @@ def auto_limit(current, cap, signals, now, changed, ceiling=None, floors=None):
     current = max(1, min(current, ceiling))
     if now - changed < AUTO_STEP:
         return current, changed
-    floors = floors or {}
-    down = [max(floors.get(k, AUTO_POLICY[k]['floor']), int(cap * p + 0.5))
+    down = [max(AUTO_POLICY[k]['floor'], int(cap * p + 0.5))
             for k, p in signals if p < AUTO_POLICY[k]['low']]
     if down:
         if current > min(min(down), cap):
@@ -342,7 +358,11 @@ class Queue:
                       # Percent per hour; per active hour for ACTIVE windows.
                       'rate': None if rate is None else round(rate * 3600, 2),
                       'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=judged,
-                                   linear=r['kind'] in LINEAR, duty=share if active else 1.0)}
+                                   duty=share if active else 1.0)}
+            if r['kind'] in LINEAR:
+                # The recent rate as is: the line holds for nonstop work, not an average day.
+                window['line'] = line_pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate)
+                window['line_until'] = line_until(r['percent'], r['resets'], WINDOWS[r['kind']], now)
             if active:
                 window['hours'] = round(24 * share, 1)  # Active hours a day the rate is projected over.
                 window['average'] = None if average is None else round(average * 3600, 2)
@@ -365,13 +385,12 @@ class Queue:
             # Heartbeats renew granted tickets every 30 s, so working time marks every bucket.
             bucket = int(self.clock() // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
             self.db.execute('INSERT OR IGNORE INTO activity VALUES (?)', (bucket,))
-        limit, until = self.cap, 0
+        limit, until, behind = self.cap, 0, []
         if self.auto:
             now = self.clock()
             windows = [w for w in self.windows() if w['resets'] > now]
             signals = [(w['kind'], w['pace']) for w in windows if w['pace'] is not None]
-            floors = {w['kind']: AUTO_POLICY[w['kind']]['under_line'] for w in windows
-                      if 'under_line' in AUTO_POLICY[w['kind']] and w['percent'] <= w['elapsed'] + LINEAR_SLACK}
+            signals += [('line', w['line']) for w in windows if w.get('line') is not None]
             previous = int(value.get('limit', self.cap))
             spent = [w['resets'] for w in windows if w['percent'] >= AUTO_TARGET]
             if spent:
@@ -381,13 +400,12 @@ class Queue:
             else:
                 if previous == 0:
                     previous = self.cap  # A renewed window starts again from the maximum.
-                limit, changed = auto_limit(previous, self.cap, signals, now, value.get('changed', 0), self.ceiling,
-                                            floors)
+                limit, changed = auto_limit(previous, self.cap, signals, now, value.get('changed', 0), self.ceiling)
                 if last is not None and now - last >= ACTIVITY_BUCKET + AUTO_IDLE:
                     # After a pause the readings already say where the limit belongs: the steps
                     # it would have taken meanwhile are taken now, in either direction.
                     for _ in range(self.ceiling):
-                        step, _ = auto_limit(limit, self.cap, signals, now, now - AUTO_STEP, self.ceiling, floors)
+                        step, _ = auto_limit(limit, self.cap, signals, now, now - AUTO_STEP, self.ceiling)
                         if step == limit:
                             break
                         limit, changed = step, now
@@ -395,9 +413,18 @@ class Queue:
                 self.note({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
                            'paces': {k: round(p, 2) for k, p in signals}})
             self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
-        self.db.execute("INSERT OR REPLACE INTO control VALUES ('effective',?),('until',?)", (limit, until))
+            # Over a linear quota every agent waits for the line to pass the reading. The stepped
+            # limit is kept, so work resumes from it, not from the maximum.
+            behind = [w['line_until'] for w in windows if w.get('line_until')]
+            if behind:
+                if value.get('effective') != 0:
+                    self.note({'at': now, 'line': max(behind), 'limit': limit})
+                limit, until = 0, max([until, *behind])
+        self.db.execute("INSERT OR REPLACE INTO control VALUES ('effective',?),('until',?),('line',?)",
+                        (limit, until, int(until in behind)))
         self.limits['agent'] = limit
         self.until = until
+        self.line = until in behind
 
     def sprints(self):
         """Live sprints as {session: until}."""
@@ -476,7 +503,7 @@ class Queue:
             with self.db:
                 self._control()
             return {'limits': self.limits, 'lease': self.lease,
-                    'auto': {'enabled': self.auto, 'cap': self.cap, 'max': self.ceiling, 'target': AUTO_TARGET, 'until': self.until,
+                    'auto': {'enabled': self.auto, 'cap': self.cap, 'max': self.ceiling, 'target': AUTO_TARGET, 'until': self.until, 'line': self.line,
                              'windows': self.windows()} if self.auto else {'enabled': False},
                     'sprints': self.sprints(),
                     'tickets': [
@@ -650,6 +677,8 @@ class Queue:
         result = {'state': row['state'], 'ticket': row['seq'], 'position': position}
         if self.limits['agent'] == 0:
             result['paused_until'] = self.until
+            if self.line:
+                result['paused_line'] = True
         return result
 
 

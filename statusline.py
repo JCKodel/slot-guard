@@ -50,7 +50,8 @@ def badge(home, session):
             limit = max(0, min(max(cap, limits.get('max', cap)), int(control['effective'])))
         if limit == 0:
             until = time.strftime('%H:%M', time.localtime(control.get('until', 0)))
-            summary = f'Agents ⏸ paused until {until} (usage limit near)'
+            reason = 'weekly usage over its line' if control.get('line') else 'usage limit near'
+            summary = f'Agents ⏸ paused until {until} ({reason})'
         else:
             summary = slot_bar('Agents', used.get('agent', 0), limit)
         if auto and limit:

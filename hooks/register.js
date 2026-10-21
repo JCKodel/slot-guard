@@ -30,13 +30,14 @@ async function acquire($, ticket, signal, registry, forceAfter, once={}) {
     const r=await call($,{...ticket,op:'acquire',wait:first||force?0:Math.min(15,forceAfter==null?15:Math.max(0,(since+forceAfter-Date.now())/1000)),
       ...(force?{force:true}:{}),...(first?once:{})});
     first=false;
-    if(r.paused_until) registry.pausedUntil=r.paused_until*1000;
+    if(r.paused_until) {registry.pausedUntil=r.paused_until*1000; registry.pausedLine=!!r.paused_line;}
     signal.throwIfAborted();
     if(r.state==='granted') {if(paused) $.ui.status(undefined); return true;}
     if(r.state!=='queued') return false;
     if(r.paused_until && !paused) {
       paused=true;
-      $.ui.status(`Slot Guard: paused until ${new Date(r.paused_until*1000).toLocaleTimeString()}, a usage window is near its limit`);
+      $.ui.status(`Slot Guard: paused until ${new Date(r.paused_until*1000).toLocaleTimeString()}, `+
+        (r.paused_line?'weekly usage is ahead of its linear quota':'a usage window is near its limit'));
     }
   }
 }
@@ -203,7 +204,7 @@ const HELP=[
   '/slots max N           Extra room above "agents": with the automatic limit, up to N agents while every usage window has plenty left. N must be above "agents"; to lower the limit, lower "agents".',
   '/slots auto on|off     Pace the limit by the usage windows (on), or keep it fixed at "agents" (off).',
   '/slots quantum N       Seconds an agent keeps its slot while others wait (default 60).',
-  '/slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a pause now.',
+  '/slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a 95% pause now.',
   '/slots evict N [N...]  Release ticket N by hand (numbers as listed by /slots).',
   `/slots sprint [all] [M] Urgent work: this session's agents (all: every session's) start at once, over the limit, for M minutes (default ${SPRINT_MINUTES}, up to 60). The others wait until it drains; a pause still stops it.`,
   '/slots sprint off      End every sprint now.',
@@ -217,9 +218,10 @@ async function status($,s) {
   const count=state=>s.tickets.filter(t=>t.state===state).length;
   const lines=s.tickets.map(t=>`#${t.seq} ${t.state} session ${t.session.slice(0,8)} pid ${t.pid}, renewed ${t.idle}s ago`);
   const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
-    [`Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots reset" or "/slots auto off" resumes now.`] : [];
+    [(s.auto.line ? `Paused: weekly usage is over its linear quota; agents resume when the quota reaches it at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots auto off" resumes now.`
+      : `Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots reset" or "/slots auto off" resumes now.`)] : [];
   const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
-    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.average==null?'':`, ${w.average}%/h over the window`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
+    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.average==null?'':`, ${w.average}%/h over the window`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)+(w.line==null?'':`, line pace ${w.line.toFixed(2)}`)).join('')] : [];
   const sprints=Object.entries(s.sprints||{});
   for(const [session,until] of sprints)
     auto.push(`Sprint: ${session==='*'?'every session':'session '+session.slice(0,8)} starts its agents at once until ${new Date(until*1000).toLocaleTimeString()}. "/slots sprint off" ends it.`);
@@ -326,8 +328,8 @@ export function register(on) {
       if(next.signal.aborted) {
         // The engine gives up on a subagent's step after 10 minutes: tell its parent to retry.
         if(e.agentId && Date.now()<(registry.pausedUntil||0)) {
-          const text=`Slot Guard paused this subagent: a usage window is near its limit. It did no work. `+
-            `Dispatch it again after ${new Date(registry.pausedUntil).toLocaleTimeString()}, when the window renews.`;
+          const text=`Slot Guard paused this subagent: ${registry.pausedLine?'weekly usage is ahead of its linear quota':'a usage window is near its limit'}. It did no work. `+
+            `Dispatch it again after ${new Date(registry.pausedUntil).toLocaleTimeString()}, when ${registry.pausedLine?'the quota catches up':'the window renews'}.`;
           yield {kind:'text',index:0,text};
           yield {kind:'stop',stopReason:'end_turn',usage:null};
           return {...emptyStep(e),answer:text,stopReason:'end_turn'};

@@ -11,8 +11,8 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, local_call, pace,
-                   process_identity, recent_rate)
+from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, line_pace,
+                   line_until, local_call, pace, process_identity, recent_rate)
 
 
 class QueueTests(unittest.TestCase):
@@ -259,9 +259,9 @@ class AutoLimitTests(unittest.TestCase):
     def test_weekly_pace_projects_over_working_hours(self):
         H = self.H
         # 2.3% per active hour, 9% used, 125 hours left: four agents' worth against 8 hours a day.
-        self.assertLess(pace(9, 125*H, 7*86400, 0, rate=2.3/H, linear=True), 0.5)
-        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=2.3/H, linear=True, duty=1/3), 0.85)
-        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=1.5/H, linear=True, duty=1/3), 1.1)
+        self.assertLess(pace(9, 125*H, 7*86400, 0, rate=2.3/H), 0.5)
+        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=2.3/H, duty=1/3), 0.85)
+        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=1.5/H, duty=1/3), 1.1)
 
     def test_pace_ignores_expired_and_first_minutes(self):
         self.assertIsNone(pace(10, -1, 5*self.H, 0))
@@ -286,12 +286,14 @@ class AutoLimitTests(unittest.TestCase):
         # The strictest window decides.
         self.assertEqual(auto_limit(4, 5, [('five_hour', 0.85), ('seven_day', 0.5)], T, 0), (3, T))
 
-    def test_weekly_window_acts_later_and_keeps_two_under_its_line(self):
+    def test_weekly_window_acts_later(self):
         T = 10**6
         self.assertEqual(auto_limit(5, 5, [('seven_day', 0.8)], T, 0), (5, 0))
         self.assertEqual(auto_limit(3, 5, [('seven_day', 0.2)], T, 0), (2, T))
-        self.assertEqual(auto_limit(2, 5, [('seven_day', 0.2)], T, 0, floors={'seven_day': 2}), (2, 0))
         self.assertEqual(auto_limit(2, 5, [('seven_day', 0.2)], T, 0), (1, T))
+        # The line acts as soon as its margin would not last, and overrules a calm week.
+        self.assertEqual(auto_limit(6, 6, [('seven_day', 1.14), ('line', 0.67)], T, 0), (5, T))
+        self.assertEqual(auto_limit(4, 6, [('seven_day', 1.14), ('line', 0.67)], T, 0), (4, 0))
 
     def test_five_hour_floor_cap_and_deadband(self):
         T = 10**6
@@ -302,13 +304,20 @@ class AutoLimitTests(unittest.TestCase):
         self.assertEqual(auto_limit(5, 3, [('five_hour', 1.0)], T, 0), (3, 0))
 
     def test_weekly_window_follows_its_linear_quota(self):
-        D = 86400
-        # Sunday 15:42: 12.9% of the week gone, 30% used: well above the line.
-        self.assertLess(pace(30, (1-0.129)*7*D, 7*D, 0, rate=0.1/3600, linear=True), 0.5)
-        # On the line (plus a point of slack): no objection.
-        self.assertGreaterEqual(pace(28, 5*D, 7*D, 0, rate=0.1/3600, linear=True), 1.0)
-        # The five-hour window is not held to a line.
-        self.assertGreater(pace(30, 4*3600, 5*3600, 0, rate=1/3600), 1.1)
+        D, H = 86400, self.H
+        week = lambda elapsed: (1 - elapsed/100)*7*D
+        # Sunday 15:42: 12.9% of the week gone, 30% used: over the line until it reaches 30%.
+        self.assertEqual(line_pace(30, week(12.9), 7*D, 0, rate=0.1/H), 0)
+        self.assertAlmostEqual(line_until(30, week(12.9), 7*D, 0), (30 - 12.9)/100*7*D)
+        # 52% used at 58.1%, 0.92% an hour: 6 points of margin last well past the horizon.
+        self.assertGreater(line_pace(52, week(58.1), 7*D, 0, rate=0.92/H), 1.1)
+        self.assertIsNone(line_until(52, week(58.1), 7*D, 0))
+        # On the line at that rate it would cross within hours: cut to about 0.6/0.92 of the agents.
+        self.assertAlmostEqual(line_pace(58, week(58), 7*D, 0, rate=0.92/H), (100/168)/0.92)
+        # Burning exactly as fast as the line rises holds it.
+        self.assertAlmostEqual(line_pace(58, week(58), 7*D, 0, rate=1/(7*D)*100), 1.0)
+        self.assertIsNone(line_pace(52, week(58.1), 7*D, 0, rate=None))
+        self.assertEqual(line_pace(52, week(58.1), 7*D, 0, rate=0), float('inf'))
 
     def test_weekly_window_lowers_to_one_and_holds_a_rise(self):
         T = 10**6
@@ -369,11 +378,26 @@ class AutoQueueTests(unittest.TestCase):
 
     def test_weekly_window_counts_and_status_reports(self):
         self.usage(10, 4)
-        self.usage(90, 24*3, kind='seven_day')
+        self.usage(40, 24*4, kind='seven_day')  # Under the line: 42.9% of the week gone.
         status = self.q.operate({'op':'status'})
-        self.assertEqual(status['limits']['agent'], 2)  # The weekly window, far ahead, keeps two.
+        self.assertEqual(status['limits']['agent'], 3)
         self.assertEqual(status['auto']['cap'], 3)
         self.assertEqual({w['kind'] for w in status['auto']['windows']}, {'five_hour', 'seven_day'})
+
+    def test_over_the_weekly_line_pauses_until_it_passes(self):
+        for k in 'ab': self.acquire(k)
+        self.usage(50, 24*3.5, kind='seven_day')  # 50% of the week gone: on the line, no pause.
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
+        self.usage(52, 24*3.5, kind='seven_day')
+        status = self.q.operate({'op':'status'})
+        self.assertEqual(status['limits']['agent'], 0)
+        self.assertTrue(status['auto']['line'])
+        self.assertAlmostEqual(status['auto']['until'], self.now + 0.02*7*86400)
+        self.assertEqual([t['state'] for t in status['tickets']], ['queued', 'queued'])
+        self.assertEqual(self.acquire('c'), 'queued')
+        self.now += 0.02*7*86400 + 1
+        self.assertEqual(self.acquire('c'), 'granted')
+        self.assertFalse(self.q.operate({'op':'status'})['auto']['line'])
 
     def test_expired_window_returns_to_configured_limit(self):
         self.usage(82, 1.1)
@@ -428,10 +452,10 @@ class AutoQueueTests(unittest.TestCase):
         for k in 'abc': self.acquire(k)
         resets = self.now + 128*self.H  # 24% elapsed.
         weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
-        weekly(41)  # Over the weekly line.
-        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 2)
+        weekly(41)  # Over the weekly line: paused.
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 0)
         self.now += AUTO_STEP
-        self.assertEqual(weekly(39)['limit'], 2)  # A slightly older response; pace 0.61 of 3 keeps 2.
+        self.assertEqual(weekly(39)['limit'], 0)  # A slightly older response.
         self.assertEqual(self.q.windows()[0]['percent'], 41)
         weekly(1)  # The upgraded account's window, or a stale response: wait for another.
         self.assertEqual(self.q.windows()[0]['percent'], 41)
@@ -508,11 +532,16 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.acquire('a'), 'granted')
         self.q.reap()  # The next call (a heartbeat) marks the work: back to one step at a time.
         self.now += AUTO_STEP
-        self.assertEqual(weekly(60)['limit'], 2)
+        self.assertEqual(weekly(60)['limit'], 0)  # Over the line: paused, one step down beneath.
+        self.assertEqual(self.stored_limit(), 2)
+
+    def stored_limit(self):
+        return self.q.db.execute("SELECT value FROM control WHERE name='limit'").fetchone()[0]
 
     def test_after_a_night_far_ahead_settles_down_at_once(self):
         self.after_working(14*self.H, 3)
-        self.assertEqual(self.usage(90, 72, kind='seven_day')['limit'], 1)
+        self.assertEqual(self.usage(90, 72, kind='seven_day')['limit'], 0)
+        self.assertEqual(self.stored_limit(), 1)
 
     def test_the_first_working_call_after_a_night_still_settles(self):
         self.after_working(14*self.H, 1)
@@ -532,11 +561,9 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.q.operate({'op':'status'})['auto']['windows'], [])
         self.assertEqual(self.acquire('a'), 'granted')
         # The limit only moves again a step after the reset.
-        resets = self.now + 128*self.H
-        weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
-        self.assertEqual(weekly(41)['limit'], 3)
+        self.assertEqual(self.usage(82, 1.1)['limit'], 3)
         self.now += AUTO_STEP
-        self.assertEqual(weekly(42)['limit'], 2)
+        self.assertEqual(self.usage(83, 1.1)['limit'], 2)
 
     def test_configure_applies_the_new_limit_at_once(self):
         home = Path(self.temp.name)/'home'

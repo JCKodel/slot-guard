@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.9-beta.1
+
+- The weekly linear quota is a ceiling, not a tolerance. Used share must never exceed elapsed share (at 58.1% of the week gone, 58%); it used to act only at pace 0.75, about a third over the line, and kept at least 2 agents while under it. Now a separate `line` vote cuts in proportion as soon as the margin to the line, at the recent rate taken as nonstop work, would not last 4 hours (6 agents burning 0.92% an hour on the line keep 4, which is about the line's own 0.6% an hour), and a reading over the line pauses every agent until the line reaches it. The limit beneath keeps falling during the pause and work resumes from it, not from the maximum. `/slots reset` no longer ends such a pause while the readings stay over the line; `/slots auto off` does. The minimum of 2 agents under the line is gone.
+- `/slots` shows the line pace, and the statusline, `/slots` and paused subagents say when a pause is for the weekly line rather than a window at 95%.
+
 ## 0.6.8-beta.1
 
 - A stale reading no longer fakes a plan change. An idle session reported last evening's weekly 32% while the window stood at 38%; the coordinator took it for a restart, dropped the window's history, and counted the live 38% six seconds later as 6 points burned, which held the limit at 1 for hours. A drop now counts only when another reading at least 5 minutes later is still that low, with none near the stored figure in between.
