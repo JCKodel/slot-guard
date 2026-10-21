@@ -35,18 +35,23 @@ AUTO_TARGET = 95.0
 AUTO_STEP = 600     # Seconds between changes of one slot.
 AUTO_WARMUP = 900   # Seconds: a window's first minutes are too noisy to act on.
 AUTO_IDLE = 3600    # Seconds without an agent working (a night): settle at once, not a step at a time.
-# Per window: below `low` the window votes a slot down (not under `floor`); above `high` it
-# lets the limit rise. The weekly window only acts at twice the pace and keeps two agents.
+# Per window: below `low` the window votes a slot down, not under `floor` nor under the
+# normal limit times its pace (a window 15% too fast needs 15% fewer agents, not one);
+# above `high` it lets the limit rise. The weekly window, judged over days, acts later,
+# and keeps `under_line` agents while its usage is under the linear quota.
 AUTO_BOOST = (1.1, 1.25)  # Above the normal limit: rise only past 1.25 everywhere, return under 1.1.
 AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
-               'seven_day': {'low': 0.9, 'high': 1.1, 'floor': 1}}
+               'seven_day': {'low': 0.75, 'high': 1.1, 'floor': 1, 'under_line': 2}}
 # Windows also held to a linear quota: used share no higher than elapsed share (1/7 a day
 # for the weekly one), so a fast start cannot borrow from the rest of the week.
 LINEAR = {'seven_day'}
 LINEAR_SLACK = 1.0  # Percent: readings come in whole points.
 # A reading of the same window this many points under the stored one means the account's
 # window started over (a plan change); readings from concurrent responses differ by less.
+# An idle session can still report its last response from hours ago, so the drop only
+# counts once a later reading, RESTART_CONFIRM seconds on, is still that low.
 RESTART_DROP = 5.0
+RESTART_CONFIRM = 300
 
 
 # Recent burn rate: readings over this span, at least MIN apart (percent moves in whole points).
@@ -116,14 +121,15 @@ def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, linear=Fal
     return result
 
 
-def auto_limit(current, cap, signals, now, changed, ceiling=None):
+def auto_limit(current, cap, signals, now, changed, ceiling=None, floors=None):
     """One slot at most every AUTO_STEP; the normal limit `cap` without data.
 
     signals: (kind, pace) of each judgeable window. Any window below its `low`
-    lowers the limit, down to the smallest floor among those windows; up to
-    `cap` it rises when every window is above its `high`. Between `cap` and
-    `ceiling` every window must be above AUTO_BOOST[1], and the limit returns
-    toward `cap` once any falls under AUTO_BOOST[0].
+    lowers the limit, down to the smallest floor among those windows: its
+    policy floor (or floors[kind]), or `cap` times its pace rounded, if more;
+    up to `cap` it rises when every window is above its `high`. Between `cap`
+    and `ceiling` every window must be above AUTO_BOOST[1], and the limit
+    returns toward `cap` once any falls under AUTO_BOOST[0].
     """
     ceiling = max(cap, ceiling or cap)
     if not signals:
@@ -131,7 +137,9 @@ def auto_limit(current, cap, signals, now, changed, ceiling=None):
     current = max(1, min(current, ceiling))
     if now - changed < AUTO_STEP:
         return current, changed
-    down = [AUTO_POLICY[k]['floor'] for k, p in signals if p < AUTO_POLICY[k]['low']]
+    floors = floors or {}
+    down = [max(floors.get(k, AUTO_POLICY[k]['floor']), int(cap * p + 0.5))
+            for k, p in signals if p < AUTO_POLICY[k]['low']]
     if down:
         if current > min(min(down), cap):
             return current - 1, now
@@ -321,14 +329,23 @@ class Queue:
                                       (r['kind'], r['resets'])).fetchall()
             active = r['kind'] in ACTIVE
             rate = recent_rate([tuple(h) for h in history], now, r['kind'], buckets if active else None)
+            average = None
+            start = r['resets'] - WINDOWS[r['kind']]
+            if active and first is not None and first <= start:
+                worked = active_time(buckets, start, now + ACTIVITY_BUCKET)
+                average = r['percent'] / worked if worked >= RATE_MIN[r['kind']] else None
+            # A burst of a few hours is not the week: the recent rate counts half, the window's
+            # own (all its working hours) the other half.
+            judged = rate if rate is None or average is None else (rate + average) / 2
             window = {'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
                       'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
                       # Percent per hour; per active hour for ACTIVE windows.
                       'rate': None if rate is None else round(rate * 3600, 2),
-                      'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=rate,
+                      'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=judged,
                                    linear=r['kind'] in LINEAR, duty=share if active else 1.0)}
             if active:
                 window['hours'] = round(24 * share, 1)  # Active hours a day the rate is projected over.
+                window['average'] = None if average is None else round(average * 3600, 2)
             result.append(window)
         return result
 
@@ -353,6 +370,8 @@ class Queue:
             now = self.clock()
             windows = [w for w in self.windows() if w['resets'] > now]
             signals = [(w['kind'], w['pace']) for w in windows if w['pace'] is not None]
+            floors = {w['kind']: AUTO_POLICY[w['kind']]['under_line'] for w in windows
+                      if 'under_line' in AUTO_POLICY[w['kind']] and w['percent'] <= w['elapsed'] + LINEAR_SLACK}
             previous = int(value.get('limit', self.cap))
             spent = [w['resets'] for w in windows if w['percent'] >= AUTO_TARGET]
             if spent:
@@ -362,12 +381,13 @@ class Queue:
             else:
                 if previous == 0:
                     previous = self.cap  # A renewed window starts again from the maximum.
-                limit, changed = auto_limit(previous, self.cap, signals, now, value.get('changed', 0), self.ceiling)
+                limit, changed = auto_limit(previous, self.cap, signals, now, value.get('changed', 0), self.ceiling,
+                                            floors)
                 if last is not None and now - last >= ACTIVITY_BUCKET + AUTO_IDLE:
                     # After a pause the readings already say where the limit belongs: the steps
                     # it would have taken meanwhile are taken now, in either direction.
                     for _ in range(self.ceiling):
-                        step, _ = auto_limit(limit, self.cap, signals, now, now - AUTO_STEP, self.ceiling)
+                        step, _ = auto_limit(limit, self.cap, signals, now, now - AUTO_STEP, self.ceiling, floors)
                         if step == limit:
                             break
                         limit, changed = step, now
@@ -511,7 +531,18 @@ class Queue:
                             type(r.get(k)) not in (int, float) or not 0 <= r[k] < 1e10 for k in ('percent', 'resets')):
                         raise ValueError('Invalid reading')
                     row = self.db.execute('SELECT percent,resets FROM usage WHERE kind=?', (r['kind'],)).fetchone()
-                    if row and abs(row['resets'] - r['resets']) <= 60 and r['percent'] < row['percent'] - RESTART_DROP:
+                    same = row and abs(row['resets'] - r['resets']) <= 60
+                    dropped = same and r['percent'] < row['percent'] - RESTART_DROP
+                    drop = f"drop:{r['kind']}"
+                    first = self.db.execute('SELECT value FROM control WHERE name=?', (drop,)).fetchone()
+                    if dropped and first is None:
+                        # Possibly a stale response: keep the stored reading until another confirms it.
+                        self.db.execute('INSERT INTO control VALUES (?,?)', (drop, self.clock()))
+                        continue
+                    if dropped and self.clock() - first[0] < RESTART_CONFIRM:
+                        continue
+                    self.db.execute('DELETE FROM control WHERE name=?', (drop,))
+                    if dropped:
                         # The account's window started over (a plan change) without a new reset time.
                         # Concurrent responses never disagree this much. Its history is stale too,
                         # and the limit starts again from the normal one, as after a renewal.
@@ -519,7 +550,7 @@ class Queue:
                         self.db.execute('DELETE FROM usage_log WHERE kind=?', (r['kind'],))
                         self.db.execute("DELETE FROM control WHERE name IN ('limit','changed')")
                         self.note({'at': self.clock(), 'restart': r['kind'], 'from': row['percent'], 'to': percent})
-                    elif row and abs(row['resets'] - r['resets']) <= 60:
+                    elif same:
                         # Sessions report the same window from different responses: usage only grows.
                         percent = max(row['percent'], r['percent'])
                     elif row and row['resets'] > r['resets']:

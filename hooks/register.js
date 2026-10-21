@@ -219,7 +219,7 @@ async function status($,s) {
   const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
     [`Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots reset" or "/slots auto off" resumes now.`] : [];
   const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
-    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
+    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.average==null?'':`, ${w.average}%/h over the window`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)).join('')] : [];
   const sprints=Object.entries(s.sprints||{});
   for(const [session,until] of sprints)
     auto.push(`Sprint: ${session==='*'?'every session':'session '+session.slice(0,8)} starts its agents at once until ${new Date(until*1000).toLocaleTimeString()}. "/slots sprint off" ends it.`);

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.8-beta.1
+
+- A stale reading no longer fakes a plan change. An idle session reported last evening's weekly 32% while the window stood at 38%; the coordinator took it for a restart, dropped the window's history, and counted the live 38% six seconds later as 6 points burned, which held the limit at 1 for hours. A drop now counts only when another reading at least 5 minutes later is still that low, with none near the stored figure in between.
+- Cuts in proportion: a window below its pace no longer lowers the limit one slot every 10 minutes all the way to 1, but only down to the normal limit times its pace (5 agents at pace 0.85 keep 4). If that is still too fast the pace falls further, and the limit with it; the 95% pause stays the backstop.
+- The weekly window acts at pace 0.75 instead of 0.9, keeps at least 2 agents while its usage is under the linear quota, and judges the mean of its recent rate and its rate over all the window's working hours, so a few busy hours are weighed against the week. `/slots` shows both rates.
+
 ## 0.6.7-beta.1
 
 - `/slots max N` at or under the normal limit no longer says "max set to N, applied now": it says no maximum is set, that the limit still goes up to `agents`, and suggests `/slots agents N` to lower it. `/slots help` and the README explain that `max` is only extra room above `agents`, never a lower ceiling.

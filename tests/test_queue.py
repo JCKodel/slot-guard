@@ -11,7 +11,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import (ACTIVITY_BUCKET, AUTO_STEP, Queue, auto_limit, configure, duty, initialize, local_call, pace,
+from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, local_call, pace,
                    process_identity, recent_rate)
 
 
@@ -271,9 +271,27 @@ class AutoLimitTests(unittest.TestCase):
 
     def test_steps_one_slot_at_most_every_interval(self):
         five = lambda p: [('five_hour', p)]
-        self.assertEqual(auto_limit(3, 3, five(0.6), 1000, 0), (2, 1000))
-        self.assertEqual(auto_limit(2, 3, five(0.6), 1000 + AUTO_STEP - 1, 1000), (2, 1000))
-        self.assertEqual(auto_limit(2, 3, five(0.6), 1000 + AUTO_STEP, 1000), (1, 1000 + AUTO_STEP))
+        self.assertEqual(auto_limit(3, 3, five(0.3), 1000, 0), (2, 1000))
+        self.assertEqual(auto_limit(2, 3, five(0.3), 1000 + AUTO_STEP - 1, 1000), (2, 1000))
+        self.assertEqual(auto_limit(2, 3, five(0.3), 1000 + AUTO_STEP, 1000), (1, 1000 + AUTO_STEP))
+
+    def test_cuts_in_proportion_to_the_pace(self):
+        T = 10**6
+        # Last night: 15% too fast cut five agents to one in 40 minutes. Now it stops at four.
+        self.assertEqual(auto_limit(5, 5, [('five_hour', 0.85)], T, 0), (4, T))
+        self.assertEqual(auto_limit(4, 5, [('five_hour', 0.85)], T, 0), (4, 0))
+        self.assertEqual(auto_limit(5, 5, [('five_hour', 0.5)], T, 0), (4, T))
+        self.assertEqual(auto_limit(3, 5, [('five_hour', 0.5)], T, 0), (3, 0))  # 2.5 rounds up.
+        self.assertEqual(auto_limit(2, 5, [('five_hour', 0.1)], T, 0), (1, T))
+        # The strictest window decides.
+        self.assertEqual(auto_limit(4, 5, [('five_hour', 0.85), ('seven_day', 0.5)], T, 0), (3, T))
+
+    def test_weekly_window_acts_later_and_keeps_two_under_its_line(self):
+        T = 10**6
+        self.assertEqual(auto_limit(5, 5, [('seven_day', 0.8)], T, 0), (5, 0))
+        self.assertEqual(auto_limit(3, 5, [('seven_day', 0.2)], T, 0), (2, T))
+        self.assertEqual(auto_limit(2, 5, [('seven_day', 0.2)], T, 0, floors={'seven_day': 2}), (2, 0))
+        self.assertEqual(auto_limit(2, 5, [('seven_day', 0.2)], T, 0), (1, T))
 
     def test_five_hour_floor_cap_and_deadband(self):
         T = 10**6
@@ -413,12 +431,50 @@ class AutoQueueTests(unittest.TestCase):
         weekly(41)  # Over the weekly line.
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 2)
         self.now += AUTO_STEP
-        self.assertEqual(weekly(39)['limit'], 1)  # A slightly older response.
+        self.assertEqual(weekly(39)['limit'], 2)  # A slightly older response; pace 0.61 of 3 keeps 2.
         self.assertEqual(self.q.windows()[0]['percent'], 41)
-        self.assertEqual(weekly(1)['limit'], 3)  # The upgraded account's window.
-        self.assertEqual(self.q.windows()[0]['percent'], 1)
+        weekly(1)  # The upgraded account's window, or a stale response: wait for another.
+        self.assertEqual(self.q.windows()[0]['percent'], 41)
+        self.now += RESTART_CONFIRM
+        self.assertEqual(weekly(2)['limit'], 3)
+        self.assertEqual(self.q.windows()[0]['percent'], 2)
         self.assertIn('restart', (Path(self.temp.name)/'auto.log').read_text())
         self.assertEqual(self.q.db.execute('SELECT count(*) FROM usage_log').fetchone()[0], 1)
+
+    def test_a_stale_response_neither_restarts_nor_counts_as_burn(self):
+        # An idle session reports 32% from hours ago, then a live one 38% six seconds later.
+        resets = self.now + 80*self.H
+        weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
+        weekly(38)
+        weekly(32)
+        self.now += 6
+        weekly(38)
+        log = Path(self.temp.name)/'auto.log'
+        self.assertNotIn('restart', log.read_text() if log.exists() else '')
+        self.assertEqual([p for p, in self.q.db.execute('SELECT percent FROM usage_log')], [38])
+        # A stale low reading long after does not commit a restart once a live one came in between.
+        self.now += RESTART_CONFIRM
+        weekly(32)
+        self.assertEqual(self.q.windows()[0]['percent'], 38)
+
+    def test_a_burst_is_weighed_against_the_whole_week(self):
+        H, B = self.H, ACTIVITY_BUCKET
+        # Ten working hours a day; 3%/h over the last three, 41% over the week's ~38 working hours.
+        resets = self.now + 78*H
+        start = resets - 7*24*H
+        days = [self.now - d*24*H for d in range(5)]  # The last one before the window began.
+        for end in days:
+            for t in range(int(end - 10*H) // B * B, int(end), B):
+                self.q.db.execute('INSERT OR IGNORE INTO activity VALUES (?)', (t,))
+        self.q.db.commit()
+        weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
+        self.now -= 3*H; weekly(32)
+        self.now += 3*H; weekly(41)
+        w = self.q.windows()[0]
+        self.assertAlmostEqual(w['rate'], 3.0, places=1)
+        self.assertLess(w['average'], 1.2)
+        self.assertGreater(w['pace'], 0.75)  # The burst alone would say 0.52.
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
 
     def test_working_time_is_recorded_and_outlives_a_reset(self):
         self.usage(9, 125, kind='seven_day')
