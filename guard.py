@@ -43,11 +43,13 @@ AUTO_BOOST = (1.1, 1.25)  # Above the normal limit: rise only past 1.25 everywhe
 AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
                'seven_day': {'low': 0.75, 'high': 1.1, 'floor': 1},
                'line': {'low': 1.0, 'high': 1.1, 'floor': 1}}
-# Windows also held to a linear quota: used share never above elapsed share (1/7 a day
-# for the weekly one), so a fast start cannot borrow from the rest of the week. A reading
-# over the line pauses every agent until the line reaches it; near it, the limit is cut.
+# Windows also held to a linear quota by the day: each day, starting at the window's reset
+# hour, allows a further 1/7 of the weekly one (14, 28, 42, 57, 71, 85, 100%), so a fast
+# start cannot borrow from the rest of the week. A reading at today's quota pauses every
+# agent until the next day's quota is above it; near it, the limit is cut.
 LINEAR = {'seven_day'}
-LINE_HORIZON = 4 * 3600  # Seconds the margin to the line must last at the recent rate.
+LINE_DAY = 86400
+LINE_HORIZON = 4 * 3600  # Seconds the margin to today's quota must last at the recent rate.
 # A reading of the same window this many points under the stored one means the account's
 # window started over (a plan change); readings from concurrent responses differ by less.
 # An idle session can still report its last response from hours ago, so the drop only
@@ -119,23 +121,45 @@ def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, duty=1.0):
     return result
 
 
+def line_day(resets, length, now):
+    """(day, days, start) of a LINEAR window: the day in progress, 1-based, of `days`
+    LINE_DAY long from `start`. None when the window is not in progress."""
+    start, days = resets - length, max(1, round(length / LINE_DAY))
+    if not start <= now < resets:
+        return None
+    return min(days, int((now - start) // LINE_DAY) + 1), days, start
+
+
+def line_cap(day, days):
+    """The linear quota of a day, in whole points: 14, 28, 42, 57, 71, 85, 100 for a week."""
+    return day * 100 // days
+
+
 def line_pace(percent, resets, length, now, rate):
-    """How long the margin to the linear quota lasts: 1 when the recent rate, kept up
-    nonstop (a night of work included), reaches the line LINE_HORIZON from now; below 1
-    sooner, while the line itself rises 100% per window length. None without a rate."""
-    left = (resets - now) / length
-    if rate is None or not 0 < left <= 1:
+    """How long the margin to today's quota lasts: 1 when the recent rate, kept up
+    nonstop (a night of work included), reaches it LINE_HORIZON from now or at the
+    day's end if sooner; below 1 sooner. None without a rate."""
+    today = line_day(resets, length, now)
+    if rate is None or today is None:
         return None
     if rate <= 0:
         return float('inf')
-    margin = 100 * (1 - left) - percent
-    return max(0.0, margin + 100 * LINE_HORIZON / length) / (rate * LINE_HORIZON)
+    day, days, start = today
+    horizon = min(LINE_HORIZON, start + day * LINE_DAY - now)
+    return max(0.0, line_cap(day, days) - percent) / (rate * horizon)
 
 
 def line_until(percent, resets, length, now):
-    """When the linear quota reaches a reading above it; None while the reading is not."""
-    until = resets - length * (1 - percent / 100)
-    return until if until > now else None
+    """While a reading has reached today's quota, the start of the first day whose quota
+    is above it (the window's reset at most); None while it is under."""
+    today = line_day(resets, length, now)
+    if today is None:
+        return None
+    day, days, start = today
+    if percent < line_cap(day, days):
+        return None
+    later = [d for d in range(day + 1, days + 1) if line_cap(d, days) > percent]
+    return start + (later[0] - 1) * LINE_DAY if later else resets
 
 
 def auto_limit(current, cap, signals, now, changed, ceiling=None):
@@ -223,6 +247,15 @@ def process_identity(pid):
     return ' '.join(fields[:-1])
 
 
+def ps_command(pid):
+    """The executable path of a process as ps reports it."""
+    p = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'comm='],
+                       capture_output=True, text=True, timeout=3)
+    if p.returncode != 0 or not p.stdout.strip():
+        raise RuntimeError('Cannot identify Claude ancestor')
+    return p.stdout.strip()
+
+
 def claude_owner():
     pid = os.getppid()
     for _ in range(12):
@@ -233,9 +266,9 @@ def claude_owner():
             lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
             path = ctypes.create_string_buffer(4096)
             n = lib.proc_pidpath(pid, path, len(path))
-            if n <= 0:
-                raise RuntimeError('Cannot identify Claude ancestor')
-            command = path.value.decode()
+            # Claude Code's updater deletes old versions under running sessions, and the
+            # path of a deleted executable is gone from libproc; ps still reports it.
+            command = path.value.decode() if n > 0 else ps_command(pid)
             parent = info.ppid
         else:
             p = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'ppid=', '-o', 'comm='],
@@ -413,8 +446,8 @@ class Queue:
                 self.note({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
                            'paces': {k: round(p, 2) for k, p in signals}})
             self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
-            # Over a linear quota every agent waits for the line to pass the reading. The stepped
-            # limit is kept, so work resumes from it, not from the maximum.
+            # At today's linear quota every agent waits for a day whose quota is above the
+            # reading. The stepped limit is kept, so work resumes from it, not from the maximum.
             behind = [w['line_until'] for w in windows if w.get('line_until')]
             if behind:
                 if value.get('effective') != 0:
@@ -810,6 +843,8 @@ def main():
     e = sub.add_parser('evict', help='Release tickets by number, as listed by status or /slots')
     e.add_argument('seqs', type=int, nargs='+')
     sub.add_parser('reset', help='Forget the usage readings and restart the automatic limit from the normal limit (after a plan change)')
+    r = sub.add_parser('sprint', help="Urgent work: every session's agents start at once, over the limit, for MINUTES (0 ends every sprint)")
+    r.add_argument('minutes', type=int)
     sub.add_parser('client')
     args = p.parse_args()
     os.umask(0o077)
@@ -829,6 +864,8 @@ def main():
     elif args.command == 'reset':
         initialize(args.home, report=False)
         print(json.dumps(local_call(args.home, {'op':'reset', 'usage':True}), indent=2))
+    elif args.command == 'sprint':
+        print(json.dumps(local_call(args.home, {'op':'sprint', 'session':'*', 'minutes':args.minutes}), indent=2))
     else:
         initialize(args.home, report=False)
         data = json.loads(sys.stdin.read(MAX_MESSAGE))

@@ -261,13 +261,13 @@ test('slots explains a pause over the weekly line and shows the line pace',async
   const weekly={kind:'seven_day',percent:59,elapsed:58.1,rate:0.92,pace:1.1,line:0,hours:11.3,average:null};
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,line:true,windows:[weekly]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/Paused: weekly usage is over its linear quota; agents resume when the quota reaches it at /);
+  assert.match(r.text,/Paused: weekly usage reached today's quota \(a seventh of the week per day, from its reset hour\); agents resume when a day with a higher quota starts at /);
   assert.match(r.text,/line pace 0\.00/);
 });
 test('a pause over the weekly line says so',async()=>{
   let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000,paused_line:true}:{state:'granted'});
   await step(h);
-  assert.equal(h.statuses.filter(t=>t&&/ahead of its linear quota/.test(t)).length,1);
+  assert.equal(h.statuses.filter(t=>t&&/reached today's quota/.test(t)).length,1);
 });
 test('a paused agent says why and clears the notice when it resumes',async()=>{
   let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000}:{state:'granted'});

@@ -3,6 +3,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import sqlite3
@@ -211,6 +213,31 @@ class QueueTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 local_call(home, {**self.data('a', op='release'), **owner})
 
+@unittest.skipUnless(sys.platform == 'darwin' and shutil.which('cc'), 'macOS with a C compiler')
+class OwnerTests(unittest.TestCase):
+    def test_claude_deleted_by_its_updater_is_still_found(self):
+        # Claude Code's updater deletes an old version while sessions still run it.
+        with tempfile.TemporaryDirectory() as temp:
+            versions = Path(temp)/'claude/versions'
+            versions.mkdir(parents=True)
+            source = Path(temp)/'claude.c'
+            # It says when it is loaded, then waits for its stdin to close.
+            source.write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n'
+                              'int main(int c, char **v) { char b; fputs("ready\\n", stderr); fflush(stderr);\n'
+                              '  while (read(0, &b, 1) > 0); return system(v[1]); }\n')
+            binary = versions/'2.1.999'
+            subprocess.run(['cc', '-o', str(binary), str(source)], check=True)
+            script = f'import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r}); ' \
+                     'import guard, json; print(json.dumps(guard.claude_owner()))'
+            p = subprocess.Popen([str(binary), f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(p.stderr.readline(), 'ready\n')
+            binary.unlink()
+            out, err = p.communicate(timeout=20)
+            self.assertEqual(p.returncode, 0, err)
+            self.assertEqual(json.loads(out)['pid'], p.pid)
+
+
 class AutoLimitTests(unittest.TestCase):
     H = 3600
     def test_pace_follows_the_recent_rate(self):
@@ -305,19 +332,26 @@ class AutoLimitTests(unittest.TestCase):
 
     def test_weekly_window_follows_its_linear_quota(self):
         D, H = 86400, self.H
-        week = lambda elapsed: (1 - elapsed/100)*7*D
-        # Sunday 15:42: 12.9% of the week gone, 30% used: over the line until it reaches 30%.
-        self.assertEqual(line_pace(30, week(12.9), 7*D, 0, rate=0.1/H), 0)
-        self.assertAlmostEqual(line_until(30, week(12.9), 7*D, 0), (30 - 12.9)/100*7*D)
-        # 52% used at 58.1%, 0.92% an hour: 6 points of margin last well past the horizon.
-        self.assertGreater(line_pace(52, week(58.1), 7*D, 0, rate=0.92/H), 1.1)
-        self.assertIsNone(line_until(52, week(58.1), 7*D, 0))
-        # On the line at that rate it would cross within hours: cut to about 0.6/0.92 of the agents.
-        self.assertAlmostEqual(line_pace(58, week(58), 7*D, 0, rate=0.92/H), (100/168)/0.92)
-        # Burning exactly as fast as the line rises holds it.
-        self.assertAlmostEqual(line_pace(58, week(58), 7*D, 0, rate=1/(7*D)*100), 1.0)
-        self.assertIsNone(line_pace(52, week(58.1), 7*D, 0, rate=None))
-        self.assertEqual(line_pace(52, week(58.1), 7*D, 0, rate=0), float('inf'))
+        week = lambda days: 7*D - days*D  # Resets of a week `days` in, now being 0.
+        # The week resets Saturday 18:00. Thursday 16:12, day 5 of 7: its quota is 71% until
+        # 18:00. A reading of 71% pauses until then, not until a continuous line reaches 71.
+        thursday = week(4 + 22.2/24)
+        self.assertAlmostEqual(line_until(71, thursday, 7*D, 0), 1.8*H)
+        self.assertEqual(line_pace(71, thursday, 7*D, 0, rate=0.5/H), 0)
+        self.assertIsNone(line_until(70, thursday, 7*D, 0))
+        # One point left: it must last until 18:00 at the recent rate.
+        self.assertAlmostEqual(line_pace(70, thursday, 7*D, 0, rate=1/H), 1/1.8)
+        # Thursday 09:00 at 60%: eleven points last well past the horizon.
+        self.assertGreater(line_pace(60, week(4 + 15/24), 7*D, 0, rate=0.92/H), 1.1)
+        self.assertAlmostEqual(line_pace(69, week(4 + 15/24), 7*D, 0, rate=0.5/H), 1.0)
+        # Days skipped: 85% on day 5 waits for day 7's 100%; a full week for its reset.
+        self.assertAlmostEqual(line_until(85, thursday, 7*D, 0), 6*D - (4*D + 22.2*H))
+        self.assertAlmostEqual(line_until(100, thursday, 7*D, 0), thursday)
+        # Day 1: 14% is its quota.
+        self.assertAlmostEqual(line_until(14, week(0.5), 7*D, 0), 0.5*D)
+        self.assertIsNone(line_until(13, week(0.5), 7*D, 0))
+        self.assertIsNone(line_pace(52, thursday, 7*D, 0, rate=None))
+        self.assertEqual(line_pace(52, thursday, 7*D, 0, rate=0), float('inf'))
 
     def test_weekly_window_lowers_to_one_and_holds_a_rise(self):
         T = 10**6
@@ -386,16 +420,16 @@ class AutoQueueTests(unittest.TestCase):
 
     def test_over_the_weekly_line_pauses_until_it_passes(self):
         for k in 'ab': self.acquire(k)
-        self.usage(50, 24*3.5, kind='seven_day')  # 50% of the week gone: on the line, no pause.
+        self.usage(56, 24*3.5, kind='seven_day')  # Day 4 of 7, quota 57%: under it, no pause.
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
-        self.usage(52, 24*3.5, kind='seven_day')
+        self.usage(57, 24*3.5, kind='seven_day')
         status = self.q.operate({'op':'status'})
         self.assertEqual(status['limits']['agent'], 0)
         self.assertTrue(status['auto']['line'])
-        self.assertAlmostEqual(status['auto']['until'], self.now + 0.02*7*86400)
+        self.assertAlmostEqual(status['auto']['until'], self.now + 0.5*86400)  # Day 5: 71%.
         self.assertEqual([t['state'] for t in status['tickets']], ['queued', 'queued'])
         self.assertEqual(self.acquire('c'), 'queued')
-        self.now += 0.02*7*86400 + 1
+        self.now += 0.5*86400 + 1
         self.assertEqual(self.acquire('c'), 'granted')
         self.assertFalse(self.q.operate({'op':'status'})['auto']['line'])
 
