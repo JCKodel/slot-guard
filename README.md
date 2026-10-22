@@ -63,7 +63,7 @@ python3 guard.py evict 12      # free ticket #12 by hand
 python3 guard.py sprint 5      # same as /slots sprint all 5; 0 ends every sprint
 ```
 
-Or `make`, which lists the same commands, with values after them as in `/slots`: `make agents 4`, `make max 6`, `make auto off`, `make quantum 60`, `make status`, `make reset`, `make evict 12 13`, `make sprint 5`, `make sprint-off`.
+Or `make`, which lists the same commands, with values after them as in `/slots`: `make agents 4`, `make max 6`, `make auto off`, `make quantum 60`, `make status`, `make reset`, `make evict 12 13`, `make sprint 5`, `make sprint-off`, and `make update` to install the latest version pushed to GitHub.
 
 `--agents` (or `/slots agents N`) is the single global limit. Three sessions without children, two working parents plus one working child, or one working parent plus two children all use three slots. Idle terminals and parents suspended waiting only for children do not count as working. A new limit applies at once to every session; work already running finishes, and the queue drains to the new limit.
 

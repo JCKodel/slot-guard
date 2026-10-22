@@ -2,7 +2,7 @@
 # Values go after the command, as in /slots: `make auto on`, `make agents 4`, `make evict 12 13`.
 PYTHON ?= python3
 GUARD := $(PYTHON) guard.py
-COMMANDS := help status agents max auto quantum reset evict sprint sprint-off test
+COMMANDS := help status agents max auto quantum reset evict sprint sprint-off update test
 
 .DEFAULT_GOAL := help
 .PHONY: $(COMMANDS)
@@ -27,6 +27,7 @@ help:
 	@echo '  make evict 12 13       Release tickets by number, as listed by status   (/slots evict N...)'
 	@echo '  make sprint [5]        Every session starts at once, for M minutes      (/slots sprint all M)'
 	@echo '  make sprint-off        End every sprint now                             (/slots sprint off)'
+	@echo '  make update            Install the latest pushed version into Claude Code (restart sessions after)'
 	@echo '  make test              Run the Python tests'
 
 status:
@@ -60,6 +61,14 @@ sprint:
 
 sprint-off:
 	@$(GUARD) sprint 0
+
+# Claude Code installs the mod from GitHub: commits not pushed yet are not in it.
+update:
+	@ahead=$$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0); \
+	  test "$$ahead" = 0 || echo "Warning: $$ahead local commit(s) not pushed; Claude Code installs what is on GitHub."
+	@claude plugin marketplace update slot-guard
+	@claude plugin update slot-guard@slot-guard
+	@echo 'Restart the running Claude sessions to load it.'
 
 test:
 	@$(PYTHON) -m unittest discover -s tests -p 'test_*.py'

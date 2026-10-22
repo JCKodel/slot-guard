@@ -4,7 +4,7 @@
 
 - The weekly linear quota goes by the day, as statuslines show it: each day from the window's reset hour allows another seventh of the week, in whole points (14, 28, 42, 57, 71, 85, 100%). A reading at today's quota pauses every agent until a day whose quota is above it starts: at 71% on Thursday 16:12 of a week that resets Saturday 18:00, until 18:00, where the continuous line let work resume at 17:16 and run past 71% before the day ended. The proportional cut paces the margin to today's quota over 4 hours, or until the day ends if sooner.
 - A session whose Claude version was deleted by Claude Code's updater no longer stops every turn with "Cannot identify Claude ancestor": libproc has no path for a deleted executable, so the owner lookup asks `ps` for it.
-- `python3 guard.py sprint M` (0 ends every sprint), and a Makefile whose `make` lists every `/slots` command with its arguments.
+- `python3 guard.py sprint M` (0 ends every sprint), and a Makefile whose `make` lists every `/slots` command, with values after them as in `/slots` (`make auto on`, `make agents 4`), plus `make update` to install the latest pushed version into Claude Code.
 
 ## 0.6.9-beta.1
 
