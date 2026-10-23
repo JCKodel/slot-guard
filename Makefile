@@ -2,7 +2,7 @@
 # Values go after the command, as in /slots: `make auto on`, `make agents 4`, `make evict 12 13`.
 PYTHON ?= python3
 GUARD := $(PYTHON) guard.py
-COMMANDS := help status agents max auto quantum reset evict sprint sprint-off update test
+COMMANDS := help status agents max auto quantum reset forget evict sprint sprint-off update test
 
 .DEFAULT_GOAL := help
 .PHONY: $(COMMANDS)
@@ -23,7 +23,8 @@ help:
 	@echo '  make max 6             Extra room above "agents" with auto on           (/slots max N)'
 	@echo '  make auto on|off       Pace the limit by the usage windows, or fix it   (/slots auto on|off)'
 	@echo '  make quantum 60        Seconds a slot is kept while others wait         (/slots quantum N)'
-	@echo '  make reset             Forget usage readings, restart from "agents"     (/slots reset)'
+	@echo '  make reset             Restart from "agents", keeping usage readings    (/slots reset)'
+	@echo '  make forget            Forget usage readings too (plan change)          (/slots forget)'
 	@echo '  make evict 12 13       Release tickets by number, as listed by status   (/slots evict N...)'
 	@echo '  make sprint [5]        Every session starts at once, for M minutes      (/slots sprint all M)'
 	@echo '  make sprint-off        End every sprint now                             (/slots sprint off)'
@@ -51,6 +52,9 @@ quantum:
 
 reset:
 	@$(GUARD) reset
+
+forget:
+	@$(GUARD) forget
 
 evict:
 	@test -n "$(VALUE)" || { echo 'Usage: make evict 12 13'; exit 2; }

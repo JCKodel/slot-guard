@@ -213,9 +213,11 @@ test('slots subcommands configure and reset, with help on misuse',async()=>{
   r=await h.handlers['command.run'](h.$,{command:'slots',args:'quantum 90'});
   assert.deepEqual(h.calls.at(-1),{op:'configure',quantum:90});
   r=await h.handlers['command.run'](h.$,{command:'slots',args:'reset'});
+  assert.deepEqual(h.calls.at(-2),{op:'reset',usage:false});assert.match(r.text,/restarts from the normal limit \(now 5\); the usage readings stay/);
+  r=await h.handlers['command.run'](h.$,{command:'slots',args:'forget'});
   assert.deepEqual(h.calls.at(-2),{op:'reset',usage:true});assert.match(r.text,/readings forgotten; the limit is 5 again/);
   const sent=h.calls.length;
-  for(const args of ['agents','agents 0','agents x','auto maybe','max 1 2','reset now','bogus','help']) {
+  for(const args of ['agents','agents 0','agents x','auto maybe','max 1 2','reset now','forget all','bogus','help']) {
     r=await h.handlers['command.run'](h.$,{command:'slots',args});
     assert.match(r.text,/\/slots agents N {8}Set the normal limit/,args);
     assert.match(r.text,args==='help'?/^Slot Guard: one machine-wide/:args==='bogus'?/^Unknown subcommand "bogus"/:/^Usage: \/slots/,args);
@@ -255,7 +257,7 @@ test('slots shows the automatic limit and window pace',async()=>{
 test('slots explains a pause and when it ends',async()=>{
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,windows:[]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/Paused: a usage window reached 95%; agents resume when it renews at .*"\/slots reset" or "\/slots auto off" resumes now/);
+  assert.match(r.text,/Paused: a usage window reached 95%; agents resume when it renews at .*"\/slots forget" or "\/slots auto off" resumes now/);
 });
 test('slots explains a pause over the weekly line and shows the line pace',async()=>{
   const weekly={kind:'seven_day',percent:59,elapsed:58.1,rate:0.92,pace:1.1,line:0,hours:11.3,average:null};

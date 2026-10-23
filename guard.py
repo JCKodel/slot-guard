@@ -49,7 +49,7 @@ AUTO_POLICY = {'five_hour': {'low': 0.9, 'high': 1.1, 'floor': 1},
 # agent until the next day's quota is above it; near it, the limit is cut.
 LINEAR = {'seven_day'}
 LINE_DAY = 86400
-LINE_HORIZON = 4 * 3600  # Seconds the margin to today's quota must last at the recent rate.
+LINE_HORIZON = 4 * 3600  # Seconds the margin to today's quota must last at the recent rate, at least.
 # A reading of the same window this many points under the stored one means the account's
 # window started over (a plan change); readings from concurrent responses differ by less.
 # An idle session can still report its last response from hours ago, so the drop only
@@ -135,18 +135,28 @@ def line_cap(day, days):
     return day * 100 // days
 
 
-def line_pace(percent, resets, length, now, rate):
-    """How long the margin to today's quota lasts: 1 when the recent rate, kept up
-    nonstop (a night of work included), reaches it LINE_HORIZON from now or at the
-    day's end if sooner; below 1 sooner. None without a rate."""
+def line_pace(percent, resets, length, now, rate, duty=None):
+    """How long the margin to today's quota lasts: 1 when the recent rate (per working
+    second) reaches it as today's working hours end, the share `duty` of the time left
+    in the day; below 1 sooner. Work spreads over the day instead of running at full
+    speed into a pause. Within LINE_HORIZON, or the day's end if sooner, the rate counts
+    as nonstop (a night of work included). Without a rate (fresh readings), the margin
+    over the part of today's points still to come, by the share of the day left, and only
+    while it is short: a fresh day neither cuts nor holds a rise. None when the window
+    is not in progress, or without a rate and with margin enough."""
     today = line_day(resets, length, now)
-    if rate is None or today is None:
+    if today is None:
         return None
+    day, days, start = today
+    left = start + day * LINE_DAY - now
+    margin = max(0.0, line_cap(day, days) - percent)
+    if rate is None:
+        share = margin / ((line_cap(day, days) - line_cap(day - 1, days)) * left / LINE_DAY)
+        return share if share < 1 else None
     if rate <= 0:
         return float('inf')
-    day, days, start = today
-    horizon = min(LINE_HORIZON, start + day * LINE_DAY - now)
-    return max(0.0, line_cap(day, days) - percent) / (rate * horizon)
+    horizon = min(left, max(LINE_HORIZON, (duty or 0) * left))
+    return margin / (rate * horizon)
 
 
 def line_until(percent, resets, length, now):
@@ -303,6 +313,9 @@ class Queue:
         self.auto = bool(auto)
         self.clock = clock
         self.log = Path(db).parent / 'auto.log'
+        # Every reading that changes a window, never cleared: the rate log is pruned and
+        # forgotten, this one is what a week can be looked back on with.
+        self.readings = Path(db).parent / 'readings.log'
         self.lease = lease
         self.quantum = quantum
         self.lock = threading.RLock()  # One connection, shared by threads in tests and tools.
@@ -393,8 +406,9 @@ class Queue:
                       'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=judged,
                                    duty=share if active else 1.0)}
             if r['kind'] in LINEAR:
-                # The recent rate as is: the line holds for nonstop work, not an average day.
-                window['line'] = line_pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate)
+                # The recent rate as is, over the working hours left today.
+                window['line'] = line_pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate,
+                                           share if active else None)
                 window['line_until'] = line_until(r['percent'], r['resets'], WINDOWS[r['kind']], now)
             if active:
                 window['hours'] = round(24 * share, 1)  # Active hours a day the rate is projected over.
@@ -402,9 +416,9 @@ class Queue:
             result.append(window)
         return result
 
-    def note(self, entry):
+    def note(self, entry, log=None):
         try:
-            with self.log.open('a') as f:
+            with (log or self.log).open('a') as f:
                 f.write(json.dumps(entry) + '\n')
         except OSError:
             pass  # The log is a convenience; admission must not depend on it.
@@ -554,9 +568,10 @@ class Queue:
                 self._promote()
             return {'evicted': n}
         if op == 'reset':
-            # The automatic limit starts again from the normal limit, now. With `usage`, the
-            # stored readings go too: after a plan change the account's windows start over,
-            # but a reading of the same window never goes down here.
+            # The automatic limit starts again from the normal limit, now; the readings and
+            # their rate stay. With `usage` (forget) the stored readings go too: after a plan
+            # change the account's windows start over, but a reading of the same window never
+            # goes down here. readings.log keeps them either way.
             with self.db:
                 self.db.execute('DELETE FROM control')
                 self.db.execute("INSERT INTO control VALUES ('changed',?)", (self.clock(),))
@@ -624,6 +639,8 @@ class Queue:
                     if last is None or last[0] != percent:
                         self.db.execute('INSERT INTO usage_log VALUES (?,?,?,?)',
                                         (r['kind'], r['resets'], percent, self.clock()))
+                        self.note({'at': self.clock(), 'kind': r['kind'], 'resets': r['resets'],
+                                   'percent': percent}, self.readings)
                 self.db.execute('DELETE FROM usage_log WHERE at<?', (self.clock() - 2 * 86400,))
                 self.db.execute('DELETE FROM activity WHERE bucket<?', (self.clock() - DUTY_SPAN - 86400,))
                 self._promote()
@@ -842,7 +859,8 @@ def main():
     sub.add_parser('status')
     e = sub.add_parser('evict', help='Release tickets by number, as listed by status or /slots')
     e.add_argument('seqs', type=int, nargs='+')
-    sub.add_parser('reset', help='Forget the usage readings and restart the automatic limit from the normal limit (after a plan change)')
+    sub.add_parser('reset', help='Restart the automatic limit from the normal limit; the usage readings stay')
+    sub.add_parser('forget', help='Forget the usage readings too (after a plan change, or to end a 95%% pause now)')
     r = sub.add_parser('sprint', help="Urgent work: every session's agents start at once, over the limit, for MINUTES (0 ends every sprint)")
     r.add_argument('minutes', type=int)
     sub.add_parser('client')
@@ -861,9 +879,9 @@ def main():
         print(json.dumps(local_call(args.home, {'op':'status'}), indent=2))
     elif args.command == 'evict':
         print(json.dumps(local_call(args.home, {'op':'evict', 'seqs':args.seqs}), indent=2))
-    elif args.command == 'reset':
+    elif args.command in ('reset', 'forget'):
         initialize(args.home, report=False)
-        print(json.dumps(local_call(args.home, {'op':'reset', 'usage':True}), indent=2))
+        print(json.dumps(local_call(args.home, {'op':'reset', 'usage':args.command == 'forget'}), indent=2))
     elif args.command == 'sprint':
         print(json.dumps(local_call(args.home, {'op':'sprint', 'session':'*', 'minutes':args.minutes}), indent=2))
     else:

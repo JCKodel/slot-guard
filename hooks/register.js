@@ -204,14 +204,15 @@ const HELP=[
   '/slots max N           Extra room above "agents": with the automatic limit, up to N agents while every usage window has plenty left. N must be above "agents"; to lower the limit, lower "agents".',
   '/slots auto on|off     Pace the limit by the usage windows (on), or keep it fixed at "agents" (off).',
   '/slots quantum N       Seconds an agent keeps its slot while others wait (default 60).',
-  '/slots reset           Forget the usage readings and restart from the normal limit: after a plan change, or to end a 95% pause now.',
+  '/slots reset           Restart the automatic limit from the normal limit, now. The usage readings and their rate stay.',
+  '/slots forget          Forget the usage readings too and restart from the normal limit: after a plan change, or to end a 95% pause now.',
   '/slots evict N [N...]  Release ticket N by hand (numbers as listed by /slots).',
   `/slots sprint [all] [M] Urgent work: this session's agents (all: every session's) start at once, over the limit, for M minutes (default ${SPRINT_MINUTES}, up to 60). The others wait until it drains; a pause still stops it.`,
   '/slots sprint off      End every sprint now.',
   '/slots help            This text.',
   '',
   'Changes apply to every session at once; running work finishes and the queue drains to the new limit.',
-  'The same is available from a checkout: python3 guard.py configure|status|reset|evict|sprint, or "make" there for the list.',
+  'The same is available from a checkout: python3 guard.py configure|status|reset|forget|evict|sprint, or "make" there for the list.',
 ].join('\n');
 async function status($,s) {
   s=s||await call($,{op:'status'});
@@ -219,7 +220,7 @@ async function status($,s) {
   const lines=s.tickets.map(t=>`#${t.seq} ${t.state} session ${t.session.slice(0,8)} pid ${t.pid}, renewed ${t.idle}s ago`);
   const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
     [(s.auto.line ? `Paused: weekly usage reached today's quota (a seventh of the week per day, from its reset hour); agents resume when a day with a higher quota starts at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots auto off" resumes now.`
-      : `Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots reset" or "/slots auto off" resumes now.`)] : [];
+      : `Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots forget" or "/slots auto off" resumes now.`)] : [];
   const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
     (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.average==null?'':`, ${w.average}%/h over the window`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`)+(w.line==null?'':`, line pace ${w.line.toFixed(2)}`)).join('')] : [];
   const sprints=Object.entries(s.sprints||{});
@@ -240,7 +241,7 @@ export function register(on) {
   let timer=null;
   on('session.start',async($,e,next)=>{
     await $.command.register({name:'slots',description:'Show or change the global working-agent limit and FIFO queue; "/slots help" lists the subcommands.',
-      argumentHint:'[help | agents N | max N | auto on|off | quantum N | sprint [all] [M] | sprint off | reset | evict N...]',immediate:true});
+      argumentHint:'[help | agents N | max N | auto on|off | quantum N | sprint [all] [M] | sprint off | reset | forget | evict N...]',immediate:true});
     if(!timer) {
       // Tickets a previous load of this mod held in this process can no longer be released by it.
       await call($,{op:'adopt',instance}).catch(()=>{});
@@ -279,10 +280,11 @@ export function register(on) {
           'its agents start at once, over the limit; the others wait until it drains. A pause near a usage window\'s limit still stops it.';
         return {text:text+'\n'+await status($)};
       }
-      if(verb==='reset') {
-        if(rest.length) return {text:'Usage: /slots reset\n\n'+HELP};
-        const r=await call($,{op:'reset',usage:true});
-        return {text:`Slot Guard: usage readings forgotten; the limit is ${r.limit} again until new readings arrive.\n`+await status($)};
+      if(verb==='reset' || verb==='forget') {
+        if(rest.length) return {text:`Usage: /slots ${verb}\n\n`+HELP};
+        const r=await call($,{op:'reset',usage:verb==='forget'});
+        return {text:(verb==='forget' ? `Slot Guard: usage readings forgotten; the limit is ${r.limit} again until new readings arrive.\n`
+          : `Slot Guard: the automatic limit restarts from the normal limit (now ${r.limit}); the usage readings stay. "/slots forget" also forgets them.\n`)+await status($)};
       }
       if(verb==='agents' || verb==='max' || verb==='quantum' || verb==='auto') {
         const value=verb==='auto' ? {on:true,off:false}[rest[0]] : Number(rest[0]);

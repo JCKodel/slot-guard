@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.11-beta.1
+
+- The day's weekly quota is spread over the working day. The margin to today's quota must last the hours usually still worked today (the learned hours a day, as a share of the day left) at the recent rate per working hour, not just 4 hours: 6 agents at 1.9% per working hour with 14 points left at the start of a day of 11.4 working hours go toward 4 at once, where they used to run at full speed until 4 hours from the quota. Within 4 hours, or the day's end, the rate still counts as nonstop work, so this is never looser than before. The quota's day starts at the window's reset hour: with a week resetting at 18:00, a morning has only the hours to 18:00 left, so the spreading is strongest in the evening and a busy morning can still reach the quota by the afternoon.
+- Without a rate (the first 2 working hours after forgetting the readings, a renewal or a plan change), the daily quota still votes once its margin is short: the margin over the share of today's points still to come (one point left at noon of a day starting at 18:00 cuts). It used to vote nothing, so the only protection was the pause at the quota. A fresh day's untouched points say nothing, so a limit cut the day before can climb again.
+- `/slots reset` only restarts the automatic limit and keeps the usage readings and their rate; `/slots forget` (`guard.py forget`, `make forget`) also forgets them, for a plan change or to end a 95% pause now. Using reset to unstick the limit used to cost the rate, and with it the pacing, for hours.
+- Every reading that changes a window is appended to `readings.log` in the state directory, which nothing clears: the rate log keeps 2 days and is cleared by forget and plan changes, which left no way to look back on a week.
+
 ## 0.6.10-beta.1
 
 - The weekly linear quota goes by the day, as statuslines show it: each day from the window's reset hour allows another seventh of the week, in whole points (14, 28, 42, 57, 71, 85, 100%). A reading at today's quota pauses every agent until a day whose quota is above it starts: at 71% on Thursday 16:12 of a week that resets Saturday 18:00, until 18:00, where the continuous line let work resume at 17:16 and run past 71% before the day ended. The proportional cut paces the margin to today's quota over 4 hours, or until the day ends if sooner.

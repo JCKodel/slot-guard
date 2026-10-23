@@ -350,8 +350,33 @@ class AutoLimitTests(unittest.TestCase):
         # Day 1: 14% is its quota.
         self.assertAlmostEqual(line_until(14, week(0.5), 7*D, 0), 0.5*D)
         self.assertIsNone(line_until(13, week(0.5), 7*D, 0))
-        self.assertIsNone(line_pace(52, thursday, 7*D, 0, rate=None))
         self.assertEqual(line_pace(52, thursday, 7*D, 0, rate=0), float('inf'))
+        self.assertIsNone(line_pace(52, 0, 7*D, 0, rate=1/H))  # The window ended.
+
+    def test_weekly_quota_spreads_over_the_working_day(self):
+        D, H = 86400, self.H
+        week = lambda days: 7*D - days*D
+        # Thursday 18:00, day 6 just started at 71%: 14 points for the day. At 1.9% per working
+        # hour and 11.4 working hours a day, they last 7.4 of the 11.4 hours left to work: cut.
+        friday = week(5)
+        self.assertAlmostEqual(line_pace(71, friday, 7*D, 0, rate=1.9/H, duty=11.4/24), 14 / (1.9*11.4))
+        # Without the working share the rate only has to last LINE_HORIZON, as before.
+        self.assertAlmostEqual(line_pace(71, friday, 7*D, 0, rate=1.9/H), 14 / (1.9*4))
+        # Near the day's end the nonstop horizon still holds: 1.8 hours left, all of them working.
+        thursday = week(4 + 22.2/24)
+        self.assertAlmostEqual(line_pace(70, thursday, 7*D, 0, rate=1/H, duty=11.4/24), 1/1.8)
+
+    def test_weekly_quota_without_a_rate_goes_by_the_share_of_the_day(self):
+        D, H = 86400, self.H
+        week = lambda days: 7*D - days*D
+        # Fresh readings (forget, renewal): a day's 14 points untouched say nothing, so a limit
+        # cut the day before can climb again.
+        self.assertIsNone(line_pace(71, week(5), 7*D, 0, rate=None))
+        self.assertIsNone(line_pace(72, week(5.25), 7*D, 0, rate=None))
+        # Six hours in, 8 points spent: 6 left for three quarters of the day's 14.
+        self.assertAlmostEqual(line_pace(79, week(5.25), 7*D, 0, rate=None), 6 / (14 * 0.75))
+        # Day 7 allows 15 points (85 to 100).
+        self.assertAlmostEqual(line_pace(95, week(6.5), 7*D, 0, rate=None), 5 / (15 * 0.5))
 
     def test_weekly_window_lowers_to_one_and_holds_a_rise(self):
         T = 10**6
@@ -420,8 +445,9 @@ class AutoQueueTests(unittest.TestCase):
 
     def test_over_the_weekly_line_pauses_until_it_passes(self):
         for k in 'ab': self.acquire(k)
-        self.usage(56, 24*3.5, kind='seven_day')  # Day 4 of 7, quota 57%: under it, no pause.
-        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
+        self.usage(56, 24*3.5, kind='seven_day')  # Day 4 of 7, quota 57%: under it, no pause,
+        # but one point for half a day, with no rate yet, already cuts a slot.
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 2)
         self.usage(57, 24*3.5, kind='seven_day')
         status = self.q.operate({'op':'status'})
         self.assertEqual(status['limits']['agent'], 0)
@@ -430,8 +456,10 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual([t['state'] for t in status['tickets']], ['queued', 'queued'])
         self.assertEqual(self.acquire('c'), 'queued')
         self.now += 0.5*86400 + 1
-        self.assertEqual(self.acquire('c'), 'granted')
-        self.assertFalse(self.q.operate({'op':'status'})['auto']['line'])
+        self.assertEqual(self.acquire('c'), 'queued')  # Work resumes from the cut limit, 2: a and b first.
+        status = self.q.operate({'op':'status'})
+        self.assertFalse(status['auto']['line'])
+        self.assertEqual([t['state'] for t in status['tickets']], ['granted', 'granted', 'queued'])
 
     def test_expired_window_returns_to_configured_limit(self):
         self.usage(82, 1.1)
@@ -598,6 +626,13 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.usage(82, 1.1)['limit'], 3)
         self.now += AUTO_STEP
         self.assertEqual(self.usage(83, 1.1)['limit'], 2)
+
+    def test_readings_log_outlives_forget(self):
+        self.usage(41, 128, kind='seven_day'); self.usage(41, 128, kind='seven_day'); self.usage(42, 128, kind='seven_day')
+        self.q.operate({'op':'reset','usage':True})
+        self.usage(43, 128, kind='seven_day')
+        log = [json.loads(l) for l in self.q.readings.read_text().splitlines()]
+        self.assertEqual([(e['kind'], e['percent']) for e in log], [('seven_day', 41), ('seven_day', 42), ('seven_day', 43)])
 
     def test_configure_applies_the_new_limit_at_once(self):
         home = Path(self.temp.name)/'home'
