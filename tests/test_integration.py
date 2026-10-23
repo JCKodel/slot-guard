@@ -244,7 +244,7 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
         self.assertGreaterEqual(len(renewals),3,renewals)
 
     def test_spent_window_pauses_until_reset_then_resumes_unattended(self):
-        local_call(self.home,{'op':'usage','readings':[{'kind':'five_hour','percent':96,'resets':time.time()+6}]})
+        local_call(self.home,{'op':'usage','readings':[{'kind':'five_hour','percent':98,'resets':time.time()+6}]})
         self.assertEqual(self.status(),[])
         sid,p=self.claude()
         time.sleep(3)

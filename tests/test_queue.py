@@ -13,8 +13,8 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, line_pace,
-                   line_until, local_call, pace, process_identity, recent_rate)
+from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, line_cap, line_pace,
+                   line_until, local_call, pace, process_identity, rate_load, recent_rate)
 
 
 class QueueTests(unittest.TestCase):
@@ -250,7 +250,7 @@ class AutoLimitTests(unittest.TestCase):
         self.assertEqual(pace(99, 2*H, 5*H, 0, rate=1/H), 0)
 
     def test_without_a_rate_pace_compares_budget_and_time_left(self):
-        self.assertAlmostEqual(pace(82, 1.1*self.H, 5*self.H, 0), (13/95)/0.22, places=6)
+        self.assertAlmostEqual(pace(82, 1.1*self.H, 5*self.H, 0), (16/98)/0.22, places=6)
         self.assertGreater(pace(30, 2*self.H, 5*self.H, 0), 1)
 
     def test_recent_rate_needs_a_long_enough_span(self):
@@ -271,6 +271,14 @@ class AutoLimitTests(unittest.TestCase):
         # Minimum history in active time: two working hours of readings at least.
         self.assertIsNone(recent_rate([(2, 0), (9, 3*H)], 3*H, 'seven_day', work[:12]))
         self.assertIsNone(recent_rate(history, 9*H, 'seven_day', []))
+
+    def test_clock_rate_and_load_both_include_idle_time(self):
+        work = [0, 300, 600, 900]
+        history = [(10, 0), (14, 3600)]
+        rate = recent_rate(history, 3600, 'five_hour')
+        load = rate_load(history, 3600, 'five_hour', work, {b: 2 for b in work})
+        self.assertAlmostEqual(load, 2/3)
+        self.assertAlmostEqual(rate / load * 3600, 6)  # 4 points / (2 agents * 1/3 hour).
 
     def test_duty_learns_hours_a_day_from_a_prior(self):
         D, B = 86400, ACTIVITY_BUCKET
@@ -296,126 +304,72 @@ class AutoLimitTests(unittest.TestCase):
         self.assertIsNotNone(pace(1, 5*self.H - 1000, 5*self.H, 0))
         self.assertIsNone(pace(1, 6*self.H, 5*self.H, 0))
 
-    def test_steps_one_slot_at_most_every_interval(self):
-        five = lambda p: [('five_hour', p)]
-        self.assertEqual(auto_limit(3, 3, five(0.3), 1000, 0), (2, 1000))
-        self.assertEqual(auto_limit(2, 3, five(0.3), 1000 + AUTO_STEP - 1, 1000), (2, 1000))
-        self.assertEqual(auto_limit(2, 3, five(0.3), 1000 + AUTO_STEP, 1000), (1, 1000 + AUTO_STEP))
+    def test_reduction_is_immediate_even_during_recovery_cooldown(self):
+        signals = [('seven_day', 1.06, 1)]
+        self.assertEqual(auto_limit(6, 6, signals, 1001, 1000), (1, 1001))
+        self.assertEqual(auto_limit(1, 6, signals, 1002, 1001), (1, 1001))
 
-    def test_cuts_in_proportion_to_the_pace(self):
-        T = 10**6
-        # Last night: 15% too fast cut five agents to one in 40 minutes. Now it stops at four.
-        self.assertEqual(auto_limit(5, 5, [('five_hour', 0.85)], T, 0), (4, T))
-        self.assertEqual(auto_limit(4, 5, [('five_hour', 0.85)], T, 0), (4, 0))
-        self.assertEqual(auto_limit(5, 5, [('five_hour', 0.5)], T, 0), (4, T))
-        self.assertEqual(auto_limit(3, 5, [('five_hour', 0.5)], T, 0), (3, 0))  # 2.5 rounds up.
-        self.assertEqual(auto_limit(2, 5, [('five_hour', 0.1)], T, 0), (1, T))
-        # The strictest window decides.
-        self.assertEqual(auto_limit(4, 5, [('five_hour', 0.85), ('seven_day', 0.5)], T, 0), (3, T))
+    def test_capacity_rounds_down_and_strictest_window_wins(self):
+        self.assertEqual(auto_limit(6, 6, [('five_hour', 2.9, 1)], 1000, 999), (2, 1000))
+        self.assertEqual(auto_limit(6, 6, [('five_hour', 4, 2), ('seven_day', 1.5, 2)], 1000, 999), (3, 1000))
+        self.assertEqual(auto_limit(6, 6, [('seven_day', 0.43)], 1000, 999), (2, 1000))
 
-    def test_a_pace_is_judged_as_if_every_slot_worked(self):
-        T = 10**6
-        # Friday evening: one agent on pace (1.06) with 12 points left; six would spend them by night.
-        self.assertEqual(auto_limit(6, 6, [('seven_day', 1.06, 1)], T, 0), (5, T))
-        self.assertEqual(auto_limit(2, 6, [('seven_day', 1.06, 1)], T, 0), (1, T))
-        self.assertEqual(auto_limit(1, 6, [('seven_day', 1.06, 1)], T, 0), (1, 0))
-        # Room for one more only once the agents working would still be on pace with it.
-        self.assertEqual(auto_limit(2, 6, [('five_hour', 1.5, 1)], T, 0), (2, 0))
-        self.assertEqual(auto_limit(2, 6, [('five_hour', 2.5, 1)], T, 0), (3, T))
-        # Not into a step down: one agent at 1.27 holds, as two would be at 0.64.
-        self.assertEqual(auto_limit(1, 6, [('seven_day', 1.27, 1), ('line', 1.8, 1)], T, 0), (1, 0))
-        # Measured over two agents, a pace of 1.5 sustains three.
-        self.assertEqual(auto_limit(4, 6, [('five_hour', 1.5, 2), ('line', 4, 2)], T, 0), (3, T))
-        self.assertEqual(auto_limit(3, 6, [('five_hour', 1.5, 2), ('line', 4, 2)], T, 0), (3, 0))
-        # Without a measured load, as before: the pace stands for the normal limit.
-        self.assertEqual(auto_limit(6, 6, [('seven_day', 1.06, None)], T, 0), (6, 0))
+    def test_recovery_requires_cooldown_and_headroom_for_new_slot(self):
+        enough = [('seven_day', 6.6, 1)]
+        self.assertEqual(auto_limit(1, 6, enough, AUTO_STEP - 1, 0), (1, 0))
+        self.assertEqual(auto_limit(1, 6, enough, AUTO_STEP, 0), (2, AUTO_STEP))
+        self.assertEqual(auto_limit(1, 6, [('seven_day', 2.05, 1)], AUTO_STEP, 0), (1, 0))
+        self.assertEqual(auto_limit(6, 6, enough, AUTO_STEP, 0, 8), (6, 0))
+        self.assertEqual(auto_limit(6, 6, [('seven_day', 8, 1)], AUTO_STEP, 0, 8), (7, AUTO_STEP))
 
-    def test_weekly_window_acts_later(self):
-        T = 10**6
-        self.assertEqual(auto_limit(5, 5, [('seven_day', 0.8)], T, 0), (5, 0))
-        self.assertEqual(auto_limit(3, 5, [('seven_day', 0.2)], T, 0), (2, T))
-        self.assertEqual(auto_limit(2, 5, [('seven_day', 0.2)], T, 0), (1, T))
-        # The line acts as soon as its margin would not last, and overrules a calm week.
-        self.assertEqual(auto_limit(6, 6, [('seven_day', 1.14), ('line', 0.67)], T, 0), (5, T))
-        self.assertEqual(auto_limit(4, 6, [('seven_day', 1.14), ('line', 0.67)], T, 0), (4, 0))
+    def test_continuous_ceiling_releases_budget_every_minute_and_ends_at_98(self):
+        for length in (5*self.H, 7*24*self.H):
+            self.assertEqual(line_cap(length, length, 0), 0)
+            self.assertAlmostEqual(line_cap(length, length, length*0.86), 84.28)
+            self.assertAlmostEqual(line_cap(length, length, 60), 98*60/length)
+            self.assertEqual(line_cap(length, length, length), 98)
+            self.assertEqual(line_cap(length, length, length+60), 98)
+        self.assertEqual(line_cap(7*24*self.H, 7*24*self.H, 24*self.H), 14)
 
-    def test_five_hour_floor_cap_and_deadband(self):
-        T = 10**6
-        self.assertEqual(auto_limit(1, 3, [('five_hour', 0)], T, 0), (1, 0))
-        self.assertEqual(auto_limit(3, 3, [('five_hour', 5)], T, 0), (3, 0))
-        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.0)], T, 0), (2, 0))
-        self.assertEqual(auto_limit(2, 3, [('five_hour', 1.5)], T, 0), (3, T))
-        self.assertEqual(auto_limit(5, 3, [('five_hour', 1.0)], T, 0), (3, 0))
+    def test_two_points_of_margin_support_one_at_observed_rate(self):
+        length = 7*24*self.H
+        now = length * 86/98
+        p = line_pace(84, length, length, now, 1.09/self.H)
+        self.assertLess(p, 1)
+        self.assertEqual(auto_limit(6, 6, [('seven_day', p, 1.03)], now, now-1)[0], 1)
+        self.assertIsNone(line_until(84, length, length, now))
+        # Plenty of margin sustains all six at this same consumption per agent.
+        p = line_pace(55, length, length, now, 1.09/self.H)
+        self.assertEqual(auto_limit(6, 6, [('seven_day', p, 1.03)], now, now-1)[0], 6)
 
-    def test_weekly_window_follows_its_linear_quota(self):
-        D, H = 86400, self.H
-        week = lambda days: 7*D - days*D  # Resets of a week `days` in, now being 0.
-        # The week resets Saturday 18:00. Thursday 16:12, day 5 of 7: its quota is 71% until
-        # 18:00. A reading of 71% pauses until then, not until a continuous line reaches 71.
-        thursday = week(4 + 22.2/24)
-        self.assertAlmostEqual(line_until(71, thursday, 7*D, 0), 1.8*H)
-        self.assertEqual(line_pace(71, thursday, 7*D, 0, rate=0.5/H), 0)
-        self.assertIsNone(line_until(70, thursday, 7*D, 0))
-        # One point left: it must last until 18:00 at the recent rate.
-        self.assertAlmostEqual(line_pace(70, thursday, 7*D, 0, rate=1/H), 1/1.8)
-        # Thursday 09:00 at 60%: eleven points last well past the horizon.
-        self.assertGreater(line_pace(60, week(4 + 15/24), 7*D, 0, rate=0.92/H), 1.1)
-        self.assertAlmostEqual(line_pace(69, week(4 + 15/24), 7*D, 0, rate=0.5/H), 1.0)
-        # Days skipped: 85% on day 5 waits for day 7's 100%; a full week for its reset.
-        self.assertAlmostEqual(line_until(85, thursday, 7*D, 0), 6*D - (4*D + 22.2*H))
-        self.assertAlmostEqual(line_until(100, thursday, 7*D, 0), thursday)
-        # Day 1: 14% is its quota.
-        self.assertAlmostEqual(line_until(14, week(0.5), 7*D, 0), 0.5*D)
-        self.assertIsNone(line_until(13, week(0.5), 7*D, 0))
-        self.assertEqual(line_pace(52, thursday, 7*D, 0, rate=0), float('inf'))
-        self.assertIsNone(line_pace(52, 0, 7*D, 0, rate=1/H))  # The window ended.
+    def test_line_allows_equality_and_waits_only_until_continuous_catchup(self):
+        for length in (5*self.H, 7*24*self.H):
+            self.assertIsNone(line_until(49, length, length, length/2))
+            self.assertAlmostEqual(line_until(50, length, length, length/2), length*50/98)
+            self.assertEqual(line_until(98, length, length, length-1), length)
+            self.assertIsNone(line_until(98, length, length, length))
+            self.assertIsNone(line_pace(0, length, length, length, None))
 
-    def test_weekly_quota_spreads_over_the_working_day(self):
-        D, H = 86400, self.H
-        week = lambda days: 7*D - days*D
-        # Thursday 18:00, day 6 just started at 71%: 14 points for the day. At 1.9% per working
-        # hour and 11.4 working hours a day, they last 7.4 of the 11.4 hours left to work: cut.
-        friday = week(5)
-        self.assertAlmostEqual(line_pace(71, friday, 7*D, 0, rate=1.9/H, duty=11.4/24), 14 / (1.9*11.4))
-        # Without the working share the rate only has to last LINE_HORIZON, as before.
-        self.assertAlmostEqual(line_pace(71, friday, 7*D, 0, rate=1.9/H), 14 / (1.9*4))
-        # Near the day's end the nonstop horizon still holds: 1.8 hours left, all of them working.
-        thursday = week(4 + 22.2/24)
-        self.assertAlmostEqual(line_pace(70, thursday, 7*D, 0, rate=1/H, duty=11.4/24), 1/1.8)
+    def test_missing_or_flat_readings_do_not_unlock_all_slots(self):
+        length = 7*24*self.H
+        for rate in (None, 0):
+            p = line_pace(48.9, length, length, length/2, rate)
+            self.assertEqual(auto_limit(6, 6, [('seven_day', p, 1)], 1000, 0)[0], 1)
+        self.assertEqual(auto_limit(1, 6, [], 1000, 0), (6, 0))
 
-    def test_weekly_quota_without_a_rate_goes_by_the_share_of_the_day(self):
-        D, H = 86400, self.H
-        week = lambda days: 7*D - days*D
-        # Fresh readings (forget, renewal): a day's 14 points untouched say nothing, so a limit
-        # cut the day before can climb again.
-        self.assertIsNone(line_pace(71, week(5), 7*D, 0, rate=None))
-        self.assertIsNone(line_pace(72, week(5.25), 7*D, 0, rate=None))
-        # Six hours in, 8 points spent: 6 left for three quarters of the day's 14.
-        self.assertAlmostEqual(line_pace(79, week(5.25), 7*D, 0, rate=None), 6 / (14 * 0.75))
-        # Day 7 allows 15 points (85 to 100).
-        self.assertAlmostEqual(line_pace(95, week(6.5), 7*D, 0, rate=None), 5 / (15 * 0.5))
-
-    def test_weekly_window_lowers_to_one_and_holds_a_rise(self):
-        T = 10**6
-        self.assertEqual(auto_limit(2, 3, [('seven_day', 0.43)], T, 0), (1, T))
-        self.assertEqual(auto_limit(1, 3, [('seven_day', 0.43)], T, 0), (1, 0))
-        self.assertEqual(auto_limit(1, 3, [('five_hour', 1.5), ('seven_day', 1.0)], T, 0), (1, 0))
-        self.assertEqual(auto_limit(1, 3, [('five_hour', 1.5), ('seven_day', 1.2)], T, 0), (2, T))
-
-    def test_above_normal_only_with_room_in_every_window(self):
-        T = 10**6
-        lots = [('five_hour', 1.4), ('seven_day', 1.3)]
-        self.assertEqual(auto_limit(3, 3, lots, T, 0, 5), (4, T))
-        self.assertEqual(auto_limit(5, 3, lots, T, 0, 5), (5, 0))
-        self.assertEqual(auto_limit(3, 3, lots, T, 0), (3, 0))  # No maximum configured.
-        self.assertEqual(auto_limit(3, 3, [('five_hour', 1.4), ('seven_day', 1.2)], T, 0, 5), (3, 0))
-        self.assertEqual(auto_limit(4, 3, [('five_hour', 1.15), ('seven_day', 1.2)], T, 0, 5), (4, 0))
-        self.assertEqual(auto_limit(5, 3, [('five_hour', 1.05), ('seven_day', 1.3)], T, 0, 5), (4, T))
-        self.assertEqual(auto_limit(5, 3, [('five_hour', 0.8)], T, 0, 5), (4, T))
-        self.assertEqual(auto_limit(5, 3, [], T, 0, 5), (3, 0))
-
-    def test_without_readings_the_configured_limit_applies(self):
-        self.assertEqual(auto_limit(1, 3, [], 10**6, 0), (3, 0))
+    def test_week_long_feedback_simulation_stays_below_continuous_ceiling(self):
+        length = 7*24*self.H
+        used, limit, changed = 0.0, 6, -AUTO_STEP
+        # Deterministic steady workload, per-agent burn below the budget refill rate.
+        # Evaluate every minute, including startup, day boundaries and the final minute.
+        for now in range(0, length, 60):
+            self.assertIsNone(line_until(used, length, length, now))
+            p = line_pace(used, length, length, now, 0.4/self.H)
+            limit, changed = auto_limit(limit, 6, [('seven_day', p, 1)], now, changed)
+            used += limit * 0.4 / 60
+            self.assertLessEqual(used, line_cap(length, length, now+60) + 1e-8)
+        self.assertGreater(used, 95)
+        self.assertLessEqual(used, 98)
 
 
 class AutoQueueTests(unittest.TestCase):
@@ -436,12 +390,15 @@ class AutoQueueTests(unittest.TestCase):
 
     def test_running_ahead_lowers_and_on_pace_restores_without_interrupting(self):
         for k in 'abc': self.assertEqual(self.acquire(k), 'granted')
-        self.assertEqual(self.usage(82, 1.1)['limit'], 2)
+        self.assertEqual(self.usage(75, 1.1)['limit'], 1)
         self.assertEqual(self.acquire('d'), 'queued')
         self.q.operate({'op':'release','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'})
-        self.assertEqual(self.acquire('d'), 'queued')  # Still 2 working: b and c.
+        self.assertEqual(self.acquire('d'), 'queued')  # Still two in-flight calls: b and c; the limit is now one.
         self.now += AUTO_STEP
-        self.usage(10, 4)  # A new window: 10% used, 20% elapsed.
+        self.usage(10, 1)  # A new window with enough margin: recover one slot at a time.
+        self.assertEqual(self.acquire('d'), 'queued')
+        self.now += AUTO_STEP
+        self.usage(10, 1 - AUTO_STEP/self.H)
         self.assertEqual(self.acquire('d'), 'granted')
         self.assertTrue((Path(self.temp.name)/'auto.log').read_text().count('\n') >= 2)
 
@@ -456,27 +413,40 @@ class AutoQueueTests(unittest.TestCase):
         self.usage(10, 4)
         self.usage(40, 24*4, kind='seven_day')  # Under the line: 42.9% of the week gone.
         status = self.q.operate({'op':'status'})
-        self.assertEqual(status['limits']['agent'], 3)
+        self.assertEqual(status['limits']['agent'], 1)
         self.assertEqual(status['auto']['cap'], 3)
+        weekly = next(w for w in status['auto']['windows'] if w['kind'] == 'seven_day')
+        self.assertAlmostEqual(weekly['ceiling'], 42)
+        self.assertAlmostEqual(weekly['margin'], 2)
         self.assertEqual({w['kind'] for w in status['auto']['windows']}, {'five_hour', 'seven_day'})
 
     def test_over_the_weekly_line_pauses_until_it_passes(self):
         for k in 'ab': self.acquire(k)
-        self.usage(56, 24*3.5, kind='seven_day')  # Day 4 of 7, quota 57%: under it, no pause,
-        # but one point for half a day, with no rate yet, already cuts a slot.
-        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 2)
-        self.usage(57, 24*3.5, kind='seven_day')
+        self.usage(49, 24*3.5, kind='seven_day')  # Exactly on the line is allowed.
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 1)
+        self.usage(50, 24*3.5, kind='seven_day')
         status = self.q.operate({'op':'status'})
         self.assertEqual(status['limits']['agent'], 0)
         self.assertTrue(status['auto']['line'])
-        self.assertAlmostEqual(status['auto']['until'], self.now + 0.5*86400)  # Day 5: 71%.
+        self.assertAlmostEqual(status['auto']['until'], self.now + 7*86400/98)
         self.assertEqual([t['state'] for t in status['tickets']], ['queued', 'queued'])
         self.assertEqual(self.acquire('c'), 'queued')
-        self.now += 0.5*86400 + 1
-        self.assertEqual(self.acquire('c'), 'queued')  # Work resumes from the cut limit, 2: a and b first.
+        self.now += 7*86400/98 + 1
+        self.assertEqual(self.acquire('c'), 'queued')
         status = self.q.operate({'op':'status'})
         self.assertFalse(status['auto']['line'])
-        self.assertEqual([t['state'] for t in status['tickets']], ['granted', 'granted', 'queued'])
+        self.assertEqual([t['state'] for t in status['tickets']], ['granted', 'queued', 'queued'])
+
+    def test_reduced_limit_is_enforced_at_next_step_without_waiting_for_quantum(self):
+        for k in 'abc': self.acquire(k)
+        self.usage(75, 1.1)
+        # Existing calls finish; their next acquire must yield even with no other waiters.
+        for k in 'ab':
+            ticket = dict(op='acquire', key=k, pool='agent', session='s', turn=k,
+                          pid=10, birth='b', rotate=True)
+            self.assertEqual(self.q.operate(ticket)['state'], 'queued')
+        self.assertEqual(self.acquire('c'), 'granted')
+        self.assertEqual(self.q.db.execute("SELECT count(*) FROM tickets WHERE state='granted'").fetchone()[0], 1)
 
     def test_expired_window_returns_to_configured_limit(self):
         self.usage(82, 1.1)
@@ -490,7 +460,7 @@ class AutoQueueTests(unittest.TestCase):
 
     def test_spent_window_pauses_everyone_until_it_renews(self):
         for k in 'ab': self.acquire(k)
-        self.usage(95, 0.5)
+        self.usage(98, 0.5)
         status = self.q.operate({'op':'status'})
         self.assertEqual(status['limits']['agent'], 0)
         self.assertEqual(status['auto']['until'], self.now + 0.5*self.H)
@@ -501,8 +471,8 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual([t['state'] for t in self.q.operate({'op':'status'})['tickets']], ['granted']*3)
 
     def test_after_a_pause_the_maximum_returns_at_once_with_both_windows(self):
-        self.usage(95, 0.5)
-        self.usage(50, 24*3, kind='seven_day')
+        self.usage(98, 0.5)
+        self.usage(30, 24*3, kind='seven_day')
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 0)
         self.now += 5*60
         self.assertIn('paused_until', self.q.operate({'op':'acquire','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'}))
@@ -512,7 +482,7 @@ class AutoQueueTests(unittest.TestCase):
     def test_no_lease_expires_during_a_pause(self):
         self.q.lease = 300
         self.acquire('a')
-        self.usage(95, 1)
+        self.usage(98, 1)
         self.q.db.execute("UPDATE tickets SET instance='mod', touched=touched-1000, created=created-1000")
         self.q.reap()
         self.assertEqual(self.q.db.execute("SELECT state FROM tickets WHERE key='a'").fetchone()[0], 'queued')
@@ -608,8 +578,8 @@ class AutoQueueTests(unittest.TestCase):
             self.q.reap()
             self.q.operate({'op':'touch','keys':['a','b'],'pid':10,'birth':'b'})
         five(14)
-        # Four buckets with both, and the first, seen once with 'a' alone (granting 'b') and once with both.
-        self.assertEqual(self.q.windows()[0]['load'], 1.9)
+        # The measured interval contains four buckets with both; the earlier bucket saw 'a' alone (granting 'b') and once with both.
+        self.assertEqual(self.q.windows()[0]['load'], 2.0)
         first = int((self.now - 4*ACTIVITY_BUCKET) // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
         self.assertEqual(tuple(self.q.db.execute('SELECT agents,samples FROM load WHERE bucket=?', (first,)).fetchone()), (3, 2))
 
@@ -629,7 +599,7 @@ class AutoQueueTests(unittest.TestCase):
         self.q.reap()  # The next call (a heartbeat) marks the work: back to one step at a time.
         self.now += AUTO_STEP
         self.assertEqual(weekly(60)['limit'], 0)  # Over the line: paused, one step down beneath.
-        self.assertEqual(self.stored_limit(), 2)
+        self.assertEqual(self.stored_limit(), 1)
 
     def stored_limit(self):
         return self.q.db.execute("SELECT value FROM control WHERE name='limit'").fetchone()[0]
@@ -650,16 +620,16 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.usage(18, 104, kind='seven_day')['limit'], 2)
 
     def test_reset_forgets_readings_and_restarts_from_the_normal_limit(self):
-        self.usage(41, 128, kind='seven_day'); self.usage(95, 1)
+        self.usage(41, 128, kind='seven_day'); self.usage(98, 1)
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 0)
         self.assertEqual(self.q.operate({'op':'reset'})['limit'], 0)  # Readings kept: still paused.
         self.assertEqual(self.q.operate({'op':'reset','usage':True})['limit'], 3)
         self.assertEqual(self.q.operate({'op':'status'})['auto']['windows'], [])
         self.assertEqual(self.acquire('a'), 'granted')
-        # The limit only moves again a step after the reset.
-        self.assertEqual(self.usage(82, 1.1)['limit'], 3)
-        self.now += AUTO_STEP
-        self.assertEqual(self.usage(83, 1.1)['limit'], 2)
+        # Reset does not bypass an immediate safety reduction.
+        self.assertEqual(self.usage(75, 1.1)['limit'], 1)
+        self.now += 1
+        self.assertEqual(self.usage(76, 1.1)['limit'], 1)
 
     def test_readings_log_outlives_forget(self):
         self.usage(41, 128, kind='seven_day'); self.usage(41, 128, kind='seven_day'); self.usage(42, 128, kind='seven_day')
@@ -672,11 +642,11 @@ class AutoQueueTests(unittest.TestCase):
         home = Path(self.temp.name)/'home'
         initialize(home, 3)
         now = time.time()
-        local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':82,'resets':now+1.1*3600}]})
-        self.assertEqual(local_call(home, {'op':'status'})['limits']['agent'], 2)
+        local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':75,'resets':now+1.1*3600}]})
+        self.assertEqual(local_call(home, {'op':'status'})['limits']['agent'], 1)
         result = configure(home, {'agents': 5})
-        self.assertEqual((result['config']['agents'], result['limits']['agent']), (5, 5))
-        self.assertEqual(local_call(home, {'op':'status'})['limits']['agent'], 5)
+        self.assertEqual((result['config']['agents'], result['limits']['agent']), (5, 1))
+        self.assertEqual(local_call(home, {'op':'status'})['limits']['agent'], 1)
         self.assertNotIn('max', configure(home, {'max': 2})['config'])  # Never under the normal limit.
         self.assertEqual(configure(home, {'max': 8})['auto']['max'], 8)
         self.assertEqual(configure(home, {'auto': False})['auto'], {'enabled': False})
@@ -747,14 +717,11 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.q.operate(self.ticket('child', rank=0))['state'], 'granted')
         self.assertEqual(self.q.operate(self.ticket('new'))['state'], 'queued')
 
-    def test_forced_admission_overdraws_but_never_during_a_pause(self):
+    def test_forced_admission_cannot_bypass_automatic_limit(self):
         for k in 'abc': self.q.operate(self.ticket(k))
+        self.assertEqual(self.q.operate(self.ticket('late', rank=0, force=True))['state'], 'queued')
+        self.q.auto = False
         self.assertEqual(self.q.operate(self.ticket('late', rank=0, force=True))['state'], 'granted')
-        self.q.operate({'op':'release','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'})
-        self.assertEqual(self.q.operate(self.ticket('next'))['state'], 'queued')  # Still 3 working.
-        self.assertIn('overdraft', (Path(self.temp.name)/'auto.log').read_text())
-        self.usage(96, 1)
-        self.assertEqual(self.q.operate(self.ticket('paused', rank=0, force=True))['state'], 'queued')
 
     def test_limit_recovers_when_recent_usage_slows(self):
         for k in 'abc': self.acquire(k)
@@ -763,9 +730,9 @@ class AutoQueueTests(unittest.TestCase):
         self.assertLess(self.q.operate({'op':'status'})['limits']['agent'], 3)
         # Hours later, slow: 26% with 3.65 h left, only 2 points in the last hour.
         resets = self.q.windows()[0]['resets']
-        for minutes in range(0, 70, 10):
+        for minutes in range(0, 80, 10):
             self.now += 600
-            self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':24 + (minutes >= 60) * 2,'resets':resets}]})
+            self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':24 + minutes/30,'resets':resets}]})
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
 
     def age_grant(self, key, seconds):

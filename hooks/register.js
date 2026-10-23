@@ -5,8 +5,8 @@ const ASK_GRACE_MS=15000;  // An ask still open this long waits for the person, 
 const FORGET_MS=600000;    // Unused agent states are dropped after this.
 const PARK_MS=60000;       // A parent's slot left for its subagent goes back to the pool after this.
 // Claude Code fails a subagent whose model step shows no progress for 600 s, counted
-// from the step's start; one waiting this long is admitted over the limit instead (never
-// during a pause), leaving the model three minutes for its first chunk.
+// from the step's start. Request an override after seven minutes; the coordinator
+// permits it only in manual mode. Automatic budgets must not be bypassed.
 const FORCE_MS=420000;
 const SPRINT_MINUTES=5;    // Default length of "/slots sprint".
 const instance=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10);
@@ -27,7 +27,7 @@ async function acquire($, ticket, signal, registry, forceAfter, once={}) {
   for (;;) {
     signal.throwIfAborted();
     const force=forceAfter!=null && Date.now()-since>=forceAfter;
-    const r=await call($,{...ticket,op:'acquire',wait:first||force?0:Math.min(15,forceAfter==null?15:Math.max(0,(since+forceAfter-Date.now())/1000)),
+    const r=await call($,{...ticket,op:'acquire',wait:first?0:15,
       ...(force?{force:true}:{}),...(first?once:{})});
     first=false;
     if(r.paused_until) {registry.pausedUntil=r.paused_until*1000; registry.pausedLine=!!r.paused_line;}
@@ -37,7 +37,7 @@ async function acquire($, ticket, signal, registry, forceAfter, once={}) {
     if(r.paused_until && !paused) {
       paused=true;
       $.ui.status(`Slot Guard: paused until ${new Date(r.paused_until*1000).toLocaleTimeString()}, `+
-        (r.paused_line?'weekly usage reached today\'s quota':'a usage window is near its limit'));
+        (r.paused_line?'continuous usage ceiling reached':'a usage window is near its limit'));
     }
   }
 }
@@ -205,7 +205,7 @@ const HELP=[
   '/slots auto on|off     Pace the limit by the usage windows (on), or keep it fixed at "agents" (off).',
   '/slots quantum N       Seconds an agent keeps its slot while others wait (default 60).',
   '/slots reset           Restart the automatic limit from the normal limit, now. The usage readings and their rate stay.',
-  '/slots forget          Forget the usage readings too and restart from the normal limit: after a plan change, or to end a 95% pause now.',
+  '/slots forget          Forget the usage readings too and restart from the normal limit: after a plan change, or to end a 98% pause now.',
   '/slots evict N [N...]  Release ticket N by hand (numbers as listed by /slots).',
   `/slots sprint [all] [M] Urgent work: this session's agents (all: every session's) start at once, over the limit, for M minutes (default ${SPRINT_MINUTES}, up to 60). The others wait until it drains; a pause still stops it.`,
   '/slots sprint off      End every sprint now.',
@@ -219,15 +219,15 @@ async function status($,s) {
   const count=state=>s.tickets.filter(t=>t.state===state).length;
   const lines=s.tickets.map(t=>`#${t.seq} ${t.state} session ${t.session.slice(0,8)} pid ${t.pid}, renewed ${t.idle}s ago`);
   const paused=s.auto&&s.auto.enabled&&s.limits.agent===0 ?
-    [(s.auto.line ? `Paused: weekly usage reached today's quota (a seventh of the week per day, from its reset hour); agents resume when a day with a higher quota starts at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots auto off" resumes now.`
+    [(s.auto.line ? `Paused: continuous usage ceiling reached; agents resume when the ceiling catches up at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots auto off" resumes now.`
       : `Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots forget" or "/slots auto off" resumes now.`)] : [];
   const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
-    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.average==null?'':`, ${w.average}%/h over the window`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`+(w.load==null?'':` at ${w.load} agents`))+(w.line==null?'':`, line pace ${w.line.toFixed(2)}`+(w.line_load==null?'':` at ${w.line_load} agents`))).join('')] : [];
+    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed`+(w.ceiling==null?'':`, ceiling ${w.ceiling.toFixed(2)}%, margin ${w.margin.toFixed(2)} pp`)+(w.supported==null?'':`, capacity ${w.supported.toFixed(2)} agents`)+(w.rate==null?'':`, ${w.rate}%/h${w.hours==null?'':' working'} lately`)+(w.average==null?'':`, ${w.average}%/h over the window`)+(w.hours==null?'':`, ~${w.hours} h/day working`)+(w.pace==null?'':`, pace ${w.pace.toFixed(2)}`+(w.load==null?'':` at ${w.load} agents`))+(w.line==null?'':`, line pace ${w.line.toFixed(2)}`+(w.line_load==null?'':` at ${w.line_load} agents`))).join('')] : [];
   const sprints=Object.entries(s.sprints||{});
   for(const [session,until] of sprints)
     auto.push(`Sprint: ${session==='*'?'every session':'session '+session.slice(0,8)} starts its agents at once until ${new Date(until*1000).toLocaleTimeString()}. "/slots sprint off" ends it.`);
   const over=count('granted')-s.limits.agent;
-  if(over>0) auto.push(`${over} over the limit: ${sprints.length?'a sprint, or ':''}subagents admitted before Claude Code's 10-minute stall limit; nothing new starts until they finish.`);
+  if(over>0) auto.push(`${over} over the limit: ${sprints.length?'a sprint, or ':''}calls admitted before the limit fell, or a manual-mode override; nothing new starts until they finish.`);
   return [`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot. "/slots help" lists the subcommands.`,...auto,...lines].join('\n');
 }
 export function register(on) {
@@ -330,8 +330,8 @@ export function register(on) {
       if(next.signal.aborted) {
         // The engine gives up on a subagent's step after 10 minutes: tell its parent to retry.
         if(e.agentId && Date.now()<(registry.pausedUntil||0)) {
-          const text=`Slot Guard paused this subagent: ${registry.pausedLine?'weekly usage reached today\'s quota':'a usage window is near its limit'}. It did no work. `+
-            `Dispatch it again after ${new Date(registry.pausedUntil).toLocaleTimeString()}, when ${registry.pausedLine?'the next day\'s quota starts':'the window renews'}.`;
+          const text=`Slot Guard paused this subagent: ${registry.pausedLine?'continuous usage ceiling reached':'a usage window is near its limit'}. It did no work. `+
+            `Dispatch it again after ${new Date(registry.pausedUntil).toLocaleTimeString()}, when ${registry.pausedLine?'the continuous ceiling catches up':'the window renews'}.`;
           yield {kind:'text',index:0,text};
           yield {kind:'stop',stopReason:'end_turn',usage:null};
           return {...emptyStep(e),answer:text,stopReason:'end_turn'};

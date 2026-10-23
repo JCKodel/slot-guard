@@ -58,15 +58,15 @@ class PackagingTests(unittest.TestCase):
             initialize(home, 3)
             import time
             now = time.time()
-            local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':82,'resets':now+1.1*3600}]})
-            self.assertEqual(badge(home,''), 'Agents □□ 0/2 (auto, normal 3)')
-            local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':96,'resets':now+1.1*3600}]})
+            local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':75,'resets':now+1.1*3600}]})
+            self.assertEqual(badge(home,''), 'Agents □ 0/1 (auto, normal 3)')
+            local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':98,'resets':now+1.1*3600}]})
             expected = time.strftime('%H:%M', time.localtime(now+1.1*3600))
             self.assertEqual(badge(home,''), f'Agents ⏸ paused until {expected} (usage limit near)')
             local_call(home, {'op':'usage','readings':[{'kind':'seven_day','percent':60,'resets':now+3.5*86400}]})
             local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':0,'resets':now+5*3600-1000}]})
-            expected = time.strftime('%H:%M', time.localtime(now+0.5*86400))  # Day 4's quota is 57%: day 5.
-            self.assertEqual(badge(home,''), f'Agents ⏸ paused until {expected} (weekly quota for today reached)')
+            expected = time.strftime('%H:%M', time.localtime(now-3.5*86400 + 60/98*7*86400))  # Continuous catchup, not a daily boundary.
+            self.assertEqual(badge(home,''), f'Agents ⏸ paused until {expected} (continuous usage ceiling reached)')
             initialize(home, None, replace=True, auto=False)
             local_call(home, {'op':'status'})
             self.assertEqual(badge(home,''), 'Agents □□□ 0/3')

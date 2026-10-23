@@ -254,6 +254,12 @@ test('slots shows the automatic limit and window pace',async()=>{
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
   assert.match(r.text,/Auto limit: 2 \(normal 3, max 3\), pacing to 95% per window; five_hour 82% used, 78% elapsed, pace 0.62/);
 });
+test('slots distinguishes elapsed time from ceiling and available margin',async()=>{
+  const h=harness(async()=>({limits:{agent:1},auto:{enabled:true,cap:6,target:98,
+    windows:[{kind:'seven_day',percent:84,elapsed:86,ceiling:84.28,margin:0.28,supported:0.55}]},tickets:[]}));
+  const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
+  assert.match(r.text,/84% used, 86% elapsed, ceiling 84.28%, margin 0.28 pp, capacity 0.55 agents/);
+});
 test('slots explains a pause and when it ends',async()=>{
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,windows:[]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
@@ -263,13 +269,13 @@ test('slots explains a pause over the weekly line and shows the line pace',async
   const weekly={kind:'seven_day',percent:59,elapsed:58.1,rate:0.92,pace:1.1,load:1.5,line:0,line_load:2,hours:11.3,average:null};
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,line:true,windows:[weekly]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/Paused: weekly usage reached today's quota \(a seventh of the week per day, from its reset hour\); agents resume when a day with a higher quota starts at /);
+  assert.match(r.text,/Paused: continuous usage ceiling reached; agents resume when the ceiling catches up at /);
   assert.match(r.text,/pace 1\.10 at 1\.5 agents, line pace 0\.00 at 2 agents/);
 });
 test('a pause over the weekly line says so',async()=>{
   let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000,paused_line:true}:{state:'granted'});
   await step(h);
-  assert.equal(h.statuses.filter(t=>t&&/reached today's quota/.test(t)).length,1);
+  assert.equal(h.statuses.filter(t=>t&&/continuous usage ceiling reached/.test(t)).length,1);
 });
 test('a paused agent says why and clears the notice when it resumes',async()=>{
   let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000}:{state:'granted'});
@@ -377,7 +383,7 @@ test('a subagent step waiting close to the stall limit is admitted by force',asy
   let now=Date.now();t.mock.method(Date,'now',()=>now);
   const h=harness(async d=>{if(d.op!=='acquire') return {};now+=200000;return {state:d.force?'granted':'queued'};});
   await step(h,{turnId:'c',agentId:'c',index:0});
-  const sent=acquires(h);assert.ok(sent.at(-1).force);assert.ok(!sent[0].force);
+  const sent=acquires(h);assert.ok(sent.at(-1).force);assert.ok(!sent[0].force);assert.equal(sent.at(-1).wait,15);
   assert.ok(sent.slice(1,-1).every(c=>c.wait<=15));
   const m=harness(async d=>{now+=200000;return {state:d.op==='acquire'&&acquires(m).length>4?'granted':'queued'};});
   await step(m);assert.ok(!acquires(m).some(c=>c.force));

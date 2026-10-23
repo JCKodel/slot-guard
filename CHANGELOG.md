@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.13-beta.1
+
+- Replace daily quotas with continuous ceilings ending at 98% for both usage windows; show the current ceiling, remaining margin, and supported agents in `/slots`.
+- Reduce directly to supported concurrency on every evaluation, including inside the recovery cooldown. Excess agents yield before their next model call; automatic forced admission no longer bypasses the budget. Recovery remains gradual.
+- Reserve one percentage point for delayed readings and in-flight calls, account for the ceiling's growth, and use conservative per-agent estimates before a rate is available. Pauses remain emergency protection, including when one agent alone consumes too fast.
+
 ## 0.6.12-beta.1
 
 - The automatic limit judges each pace as if every slot it allows were working. The coordinator now records how many agents work in each 5-minute bucket, and a pace measured behind fewer agents than the limit is scaled to the limit: one agent on pace with 12 points left in the week says nothing about six, which would spend them by night. It used to read the pace at the load of the moment, so a light evening raised the limit to 6 while only 1 agent was working, with nothing to stop a burst but the 95% pause. A window that runs ahead now cuts to the agents its pace sustains (pace times the agents behind it), and the limit rises one slot at a time while those agents would still be on pace with one more. Working time recorded before this version counts as 1 agent. `/slots` shows the agents behind each pace.
