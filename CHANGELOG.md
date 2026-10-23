@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.12-beta.1
+
+- The automatic limit judges each pace as if every slot it allows were working. The coordinator now records how many agents work in each 5-minute bucket, and a pace measured behind fewer agents than the limit is scaled to the limit: one agent on pace with 12 points left in the week says nothing about six, which would spend them by night. It used to read the pace at the load of the moment, so a light evening raised the limit to 6 while only 1 agent was working, with nothing to stop a burst but the 95% pause. A window that runs ahead now cuts to the agents its pace sustains (pace times the agents behind it), and the limit rises one slot at a time while those agents would still be on pace with one more. Working time recorded before this version counts as 1 agent. `/slots` shows the agents behind each pace.
+
 ## 0.6.11-beta.1
 
 - The day's weekly quota is spread over the working day. The margin to today's quota must last the hours usually still worked today (the learned hours a day, as a share of the day left) at the recent rate per working hour, not just 4 hours: 6 agents at 1.9% per working hour with 14 points left at the start of a day of 11.4 working hours go toward 4 at once, where they used to run at full speed until 4 hours from the quota. Within 4 hours, or the day's end, the rate still counts as nonstop work, so this is never looser than before. The quota's day starts at the window's reset hour: with a week resetting at 18:00, a morning has only the hours to 18:00 left, so the spreading is strongest in the evening and a busy morning can still reach the quota by the afternoon.

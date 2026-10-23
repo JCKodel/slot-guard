@@ -260,11 +260,11 @@ test('slots explains a pause and when it ends',async()=>{
   assert.match(r.text,/Paused: a usage window reached 95%; agents resume when it renews at .*"\/slots forget" or "\/slots auto off" resumes now/);
 });
 test('slots explains a pause over the weekly line and shows the line pace',async()=>{
-  const weekly={kind:'seven_day',percent:59,elapsed:58.1,rate:0.92,pace:1.1,line:0,hours:11.3,average:null};
+  const weekly={kind:'seven_day',percent:59,elapsed:58.1,rate:0.92,pace:1.1,load:1.5,line:0,line_load:2,hours:11.3,average:null};
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,line:true,windows:[weekly]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
   assert.match(r.text,/Paused: weekly usage reached today's quota \(a seventh of the week per day, from its reset hour\); agents resume when a day with a higher quota starts at /);
-  assert.match(r.text,/line pace 0\.00/);
+  assert.match(r.text,/pace 1\.10 at 1\.5 agents, line pace 0\.00 at 2 agents/);
 });
 test('a pause over the weekly line says so',async()=>{
   let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000,paused_line:true}:{state:'granted'});

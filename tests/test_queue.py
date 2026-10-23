@@ -313,6 +313,23 @@ class AutoLimitTests(unittest.TestCase):
         # The strictest window decides.
         self.assertEqual(auto_limit(4, 5, [('five_hour', 0.85), ('seven_day', 0.5)], T, 0), (3, T))
 
+    def test_a_pace_is_judged_as_if_every_slot_worked(self):
+        T = 10**6
+        # Friday evening: one agent on pace (1.06) with 12 points left; six would spend them by night.
+        self.assertEqual(auto_limit(6, 6, [('seven_day', 1.06, 1)], T, 0), (5, T))
+        self.assertEqual(auto_limit(2, 6, [('seven_day', 1.06, 1)], T, 0), (1, T))
+        self.assertEqual(auto_limit(1, 6, [('seven_day', 1.06, 1)], T, 0), (1, 0))
+        # Room for one more only once the agents working would still be on pace with it.
+        self.assertEqual(auto_limit(2, 6, [('five_hour', 1.5, 1)], T, 0), (2, 0))
+        self.assertEqual(auto_limit(2, 6, [('five_hour', 2.5, 1)], T, 0), (3, T))
+        # Not into a step down: one agent at 1.27 holds, as two would be at 0.64.
+        self.assertEqual(auto_limit(1, 6, [('seven_day', 1.27, 1), ('line', 1.8, 1)], T, 0), (1, 0))
+        # Measured over two agents, a pace of 1.5 sustains three.
+        self.assertEqual(auto_limit(4, 6, [('five_hour', 1.5, 2), ('line', 4, 2)], T, 0), (3, T))
+        self.assertEqual(auto_limit(3, 6, [('five_hour', 1.5, 2), ('line', 4, 2)], T, 0), (3, 0))
+        # Without a measured load, as before: the pace stands for the normal limit.
+        self.assertEqual(auto_limit(6, 6, [('seven_day', 1.06, None)], T, 0), (6, 0))
+
     def test_weekly_window_acts_later(self):
         T = 10**6
         self.assertEqual(auto_limit(5, 5, [('seven_day', 0.8)], T, 0), (5, 0))
@@ -552,11 +569,13 @@ class AutoQueueTests(unittest.TestCase):
         for end in days:
             for t in range(int(end - 10*H) // B * B, int(end), B):
                 self.q.db.execute('INSERT OR IGNORE INTO activity VALUES (?)', (t,))
+                self.q.db.execute('INSERT OR IGNORE INTO load VALUES (?,6,2)', (t,))  # All 3 slots working.
         self.q.db.commit()
         weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
         self.now -= 3*H; weekly(32)
         self.now += 3*H; weekly(41)
         w = self.q.windows()[0]
+        self.assertEqual(w['load'], 3)
         self.assertAlmostEqual(w['rate'], 3.0, places=1)
         self.assertLess(w['average'], 1.2)
         self.assertGreater(w['pace'], 0.75)  # The burst alone would say 0.52.
@@ -578,6 +597,21 @@ class AutoQueueTests(unittest.TestCase):
         weekly = self.q.windows()[0]
         self.assertIsNone(weekly['rate'])  # A restarted window waits for two working hours of readings.
         self.assertGreater(weekly['hours'], 8)
+
+    def test_agents_working_behind_the_rate_are_recorded(self):
+        resets = self.now + 4*self.H
+        five = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':percent,'resets':resets}]})
+        self.acquire('a'); self.acquire('b')
+        five(10)
+        for _ in range(4):
+            self.now += ACTIVITY_BUCKET
+            self.q.reap()
+            self.q.operate({'op':'touch','keys':['a','b'],'pid':10,'birth':'b'})
+        five(14)
+        # Four buckets with both, and the first, seen once with 'a' alone (granting 'b') and once with both.
+        self.assertEqual(self.q.windows()[0]['load'], 1.9)
+        first = int((self.now - 4*ACTIVITY_BUCKET) // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
+        self.assertEqual(tuple(self.q.db.execute('SELECT agents,samples FROM load WHERE bucket=?', (first,)).fetchone()), (3, 2))
 
     def after_working(self, ago, limit):
         """The limit `limit`, last changed and last worked `ago` seconds before now."""

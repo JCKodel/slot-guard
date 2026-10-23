@@ -76,6 +76,12 @@ def active_time(buckets, start, end):
     return ACTIVITY_BUCKET * (bisect_left(buckets, end) - bisect_left(buckets, start))
 
 
+def concurrency(buckets, loads):
+    """Mean agents working over `buckets` (start times), each its mean over the calls that saw
+    it (`loads`: bucket -> agents); a bucket without one counts as 1. None without buckets."""
+    return sum(loads.get(b, 1.0) for b in buckets) / len(buckets) if buckets else None
+
+
 def duty(buckets, first, now):
     """Share of the time with an agent working, over the last DUTY_SPAN since `first` (the
     oldest bucket recorded), with DUTY_PRIOR blended in so a fresh install has a guess."""
@@ -175,9 +181,13 @@ def line_until(percent, resets, length, now):
 def auto_limit(current, cap, signals, now, changed, ceiling=None):
     """One slot at most every AUTO_STEP; the normal limit `cap` without data.
 
-    signals: (kind, pace) of each judgeable window. Any window below its `low`
+    signals: (kind, pace[, load]) of each judgeable window, `load` the agents working
+    behind its pace, None or absent when it was not measured. A measured pace is judged
+    as if all `current` slots worked (pace scales inversely with the burn rate):
+    one agent on pace says nothing about six. Any window below its `low`
     lowers the limit, down to the smallest floor among those windows: its
-    policy floor, or `cap` times its pace rounded, if more;
+    policy floor, or the agents its pace sustains (pace times load; `cap`
+    times pace without a load) rounded, if more;
     up to `cap` it rises when every window is above its `high`. Between `cap`
     and `ceiling` every window must be above AUTO_BOOST[1], and the limit
     returns toward `cap` once any falls under AUTO_BOOST[0].
@@ -188,18 +198,27 @@ def auto_limit(current, cap, signals, now, changed, ceiling=None):
     current = max(1, min(current, ceiling))
     if now - changed < AUTO_STEP:
         return current, changed
-    down = [max(AUTO_POLICY[k]['floor'], int(cap * p + 0.5))
-            for k, p in signals if p < AUTO_POLICY[k]['low']]
-    if down:
-        if current > min(min(down), cap):
-            return current - 1, now
-        return current, changed
-    paces = [p for _, p in signals]
-    if current > cap and min(paces) < AUTO_BOOST[0]:
+    def judged(limit):
+        """(kind, pace with `limit` slots working, agents it sustains) of each signal."""
+        return [(k, p, cap * p) if not load or load[0] is None else (k, p * load[0] / limit, p * load[0])
+                for k, p, *load in signals]
+
+    def falls(limit):
+        """Whether the limit steps down from `limit`, as a step up must not undo itself."""
+        down = [max(AUTO_POLICY[k]['floor'], int(sustained + 0.5))
+                for k, p, sustained in judged(limit) if p < AUTO_POLICY[k]['low']]
+        if down:
+            return limit > min(min(down), cap)
+        return limit > cap and min(p for _, p, _ in judged(limit)) < AUTO_BOOST[0]
+
+    if falls(current):
         return current - 1, now
-    if current < cap and all(p > AUTO_POLICY[k]['high'] for k, p in signals):
+    paces = judged(current)
+    if any(p < AUTO_POLICY[k]['low'] for k, p, _ in paces) or falls(current + 1):
+        return current, changed
+    if current < cap and all(p > AUTO_POLICY[k]['high'] for k, p, _ in paces):
         return current + 1, now
-    if cap <= current < ceiling and min(paces) > AUTO_BOOST[1]:
+    if cap <= current < ceiling and min(p for _, p, _ in paces) > AUTO_BOOST[1]:
         return current + 1, now
     return current, changed
 
@@ -342,6 +361,10 @@ class Queue:
         # Start times of ACTIVITY_BUCKETs with an agent working; kept through resets and plan
         # changes, which restart the usage windows but not the user's working hours.
         self.db.execute('CREATE TABLE IF NOT EXISTS activity (bucket INTEGER PRIMARY KEY)')
+        # Working agents seen per bucket (their sum over `samples` calls), apart from `activity`
+        # so older coordinators sharing the database keep inserting there unchanged.
+        self.db.execute('''CREATE TABLE IF NOT EXISTS load (bucket INTEGER PRIMARY KEY,
+            agents REAL NOT NULL, samples INTEGER NOT NULL)''')
         # Sessions ('*': every session) whose agents start at once, over the limit, until `until`.
         self.db.execute('CREATE TABLE IF NOT EXISTS sprints (session TEXT PRIMARY KEY, until REAL NOT NULL)')
         if 'rank' not in columns:
@@ -383,6 +406,8 @@ class Queue:
                                                  (now - DUTY_SPAN - ACTIVITY_BUCKET,))]
         first = self.db.execute('SELECT min(bucket) FROM activity').fetchone()[0]
         share = duty(buckets, first, now)
+        loads = dict(self.db.execute('SELECT bucket,agents/samples FROM load WHERE bucket>=?',
+                                     (now - DUTY_SPAN - ACTIVITY_BUCKET,)))
         result = []
         for r in self.db.execute('SELECT * FROM usage').fetchall():
             if r['kind'] not in WINDOWS:
@@ -399,16 +424,28 @@ class Queue:
             # A burst of a few hours is not the week: the recent rate counts half, the window's
             # own (all its working hours) the other half.
             judged = rate if rate is None or average is None else (rate + average) / 2
+            # Agents working behind each rate: the limit is judged as if all its slots worked.
+            # The five-hour rate stays per clock second, so idle stretches keep counting.
+            recent = (buckets[-(RATE_SPAN[r['kind']] // ACTIVITY_BUCKET):] if active else
+                      buckets[bisect_left(buckets, now - RATE_SPAN[r['kind']]):])
+            load = concurrency(recent, loads) if rate is not None else None
+            line_load = load
+            if load is not None and average is not None:
+                whole = concurrency(buckets[bisect_left(buckets, start):], loads)
+                solo = (rate / load + average / whole) / 2
+                load = judged / solo if solo > 0 else load
             window = {'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
                       'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
                       # Percent per hour; per active hour for ACTIVE windows.
                       'rate': None if rate is None else round(rate * 3600, 2),
                       'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=judged,
-                                   duty=share if active else 1.0)}
+                                   duty=share if active else 1.0),
+                      'load': None if load is None else round(load, 2)}
             if r['kind'] in LINEAR:
                 # The recent rate as is, over the working hours left today.
                 window['line'] = line_pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate,
                                            share if active else None)
+                window['line_load'] = None if line_load is None else round(line_load, 2)
                 window['line_until'] = line_until(r['percent'], r['resets'], WINDOWS[r['kind']], now)
             if active:
                 window['hours'] = round(24 * share, 1)  # Active hours a day the rate is projected over.
@@ -428,16 +465,21 @@ class Queue:
         value = dict(self.db.execute('SELECT name,value FROM control'))
         # Read before this call marks its own bucket, or the first call after a pause hides it.
         last = self.db.execute('SELECT max(bucket) FROM activity').fetchone()[0]
-        if self.db.execute("SELECT 1 FROM tickets WHERE state='granted' LIMIT 1").fetchone():
+        working = self.db.execute("SELECT count(*) FROM tickets WHERE state='granted'").fetchone()[0]
+        if working:
             # Heartbeats renew granted tickets every 30 s, so working time marks every bucket.
             bucket = int(self.clock() // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
             self.db.execute('INSERT OR IGNORE INTO activity VALUES (?)', (bucket,))
+            # Weighted by calls, not time: more agents heartbeat more often, so a bucket's load
+            # leans to its busier minutes, which makes the scaling a little less strict.
+            self.db.execute('''INSERT INTO load VALUES (?,?,1) ON CONFLICT(bucket)
+                DO UPDATE SET agents=agents+excluded.agents, samples=samples+1''', (bucket, working))
         limit, until, behind = self.cap, 0, []
         if self.auto:
             now = self.clock()
             windows = [w for w in self.windows() if w['resets'] > now]
-            signals = [(w['kind'], w['pace']) for w in windows if w['pace'] is not None]
-            signals += [('line', w['line']) for w in windows if w.get('line') is not None]
+            signals = [(w['kind'], w['pace'], w['load']) for w in windows if w['pace'] is not None]
+            signals += [('line', w['line'], w['line_load']) for w in windows if w.get('line') is not None]
             previous = int(value.get('limit', self.cap))
             spent = [w['resets'] for w in windows if w['percent'] >= AUTO_TARGET]
             if spent:
@@ -458,7 +500,8 @@ class Queue:
                         limit, changed = step, now
             if limit != previous:
                 self.note({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
-                           'paces': {k: round(p, 2) for k, p in signals}})
+                           'paces': {k: round(p, 2) for k, p, _ in signals},
+                           'loads': {k: l for k, _, l in signals if l is not None}})
             self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
             # At today's linear quota every agent waits for a day whose quota is above the
             # reading. The stepped limit is kept, so work resumes from it, not from the maximum.
@@ -643,6 +686,7 @@ class Queue:
                                    'percent': percent}, self.readings)
                 self.db.execute('DELETE FROM usage_log WHERE at<?', (self.clock() - 2 * 86400,))
                 self.db.execute('DELETE FROM activity WHERE bucket<?', (self.clock() - DUTY_SPAN - 86400,))
+                self.db.execute('DELETE FROM load WHERE bucket<?', (self.clock() - DUTY_SPAN - 86400,))
                 self._promote()
             return {'limit': self.limits['agent']}
         if op == 'rotate':
