@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.14-beta.1
+
+- One rule sets each window's capacity: what is left of 98% spread over the working time left, divided by the consumption per agent, and never more than stays within a point of the continuous ceiling for the next hour. The week's working time is learned from activity, so office hours spread the week over office hours and a machine working around the clock over the clock. The end-of-window pace, the weekly average blend and the four-hour margin spending are gone; a night's unused budget no longer bursts every morning and cuts back every afternoon.
+- Readings are whole points: the pause allows one point over the ceiling, so a renewed week's first 1% no longer pauses everything for an hour and a half.
+- A renewed window starts from the consumption per agent its previous window ended with instead of the startup estimate, until it measures its own.
+- The weekly rate is measured over the last two working hours (at least one), not four (at least two), so a faster pace shows sooner.
+- `/slots` shows each window's capacity, its rate per agent and where it comes from (measured, inherited or default).
+
 ## 0.6.13-beta.1
 
 - Replace daily quotas with continuous ceilings ending at 98% for both usage windows; show the current ceiling, remaining margin, and supported agents in `/slots`.

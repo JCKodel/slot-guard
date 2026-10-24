@@ -65,7 +65,8 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(badge(home,''), f'Agents ⏸ paused until {expected} (usage limit near)')
             local_call(home, {'op':'usage','readings':[{'kind':'seven_day','percent':60,'resets':now+3.5*86400}]})
             local_call(home, {'op':'usage','readings':[{'kind':'five_hour','percent':0,'resets':now+5*3600-1000}]})
-            expected = time.strftime('%H:%M', time.localtime(now-3.5*86400 + 60/98*7*86400))  # Continuous catchup, not a daily boundary.
+            # Continuous catchup to within the point of tolerance, not a daily boundary.
+            expected = time.strftime('%H:%M', time.localtime(now-3.5*86400 + 59/98*7*86400))
             self.assertEqual(badge(home,''), f'Agents ⏸ paused until {expected} (continuous usage ceiling reached)')
             initialize(home, None, replace=True, auto=False)
             local_call(home, {'op':'status'})

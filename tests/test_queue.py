@@ -13,8 +13,8 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, line_cap, line_pace,
-                   line_until, local_call, pace, process_identity, rate_load, recent_rate)
+from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, line_cap, capacity,
+                   line_until, local_call, process_identity, rate_load, recent_rate)
 
 
 class QueueTests(unittest.TestCase):
@@ -240,18 +240,6 @@ class OwnerTests(unittest.TestCase):
 
 class AutoLimitTests(unittest.TestCase):
     H = 3600
-    def test_pace_follows_the_recent_rate(self):
-        H = self.H
-        # A fast start: 14% in the first 30 minutes, 28%/h against a sustainable ~18%/h.
-        self.assertLess(pace(14, 4.5*H, 5*H, 0, rate=14/(0.5*H)), 0.9)
-        # This morning's case: 26% used, but only ~4%/h lately with 3.65 h left.
-        self.assertGreater(pace(26, 3.65*H, 5*H, 0, rate=4/H), 1.25)
-        self.assertEqual(pace(30, 2*H, 5*H, 0, rate=0), float('inf'))
-        self.assertEqual(pace(99, 2*H, 5*H, 0, rate=1/H), 0)
-
-    def test_without_a_rate_pace_compares_budget_and_time_left(self):
-        self.assertAlmostEqual(pace(82, 1.1*self.H, 5*self.H, 0), (16/98)/0.22, places=6)
-        self.assertGreater(pace(30, 2*self.H, 5*self.H, 0), 1)
 
     def test_recent_rate_needs_a_long_enough_span(self):
         H = self.H
@@ -262,15 +250,6 @@ class AutoLimitTests(unittest.TestCase):
         self.assertIsNone(recent_rate([(5, 0), (10, 600)], 2*H, 'five_hour'))
         self.assertEqual(recent_rate([(10, 0), (10, 900)], 1000, 'five_hour'), 0)
 
-    def test_active_rate_counts_only_working_time(self):
-        H, B = self.H, ACTIVITY_BUCKET
-        # 6% over 3 hours of work spread across 9 hours: 2% per active hour, not 0.67.
-        work = [t for t in range(0, 9*H, B) if t % (3*H) < H]
-        history = [(2, 0), (4, 3*H), (6, 6*H), (8, 9*H - 1)]
-        self.assertAlmostEqual(recent_rate(history, 9*H, 'seven_day', work)*H, 2.0)
-        # Minimum history in active time: two working hours of readings at least.
-        self.assertIsNone(recent_rate([(2, 0), (9, 3*H)], 3*H, 'seven_day', work[:12]))
-        self.assertIsNone(recent_rate(history, 9*H, 'seven_day', []))
 
     def test_clock_rate_and_load_both_include_idle_time(self):
         work = [0, 300, 600, 900]
@@ -279,6 +258,7 @@ class AutoLimitTests(unittest.TestCase):
         load = rate_load(history, 3600, 'five_hour', work, {b: 2 for b in work})
         self.assertAlmostEqual(load, 2/3)
         self.assertAlmostEqual(rate / load * 3600, 6)  # 4 points / (2 agents * 1/3 hour).
+
 
     def test_duty_learns_hours_a_day_from_a_prior(self):
         D, B = 86400, ACTIVITY_BUCKET
@@ -291,36 +271,6 @@ class AutoLimitTests(unittest.TestCase):
         # A week off: only the prior's 8 hours remain, spread over eight days.
         self.assertAlmostEqual(duty(four, four[0], 20*D)*24, 1.0)
 
-    def test_weekly_pace_projects_over_working_hours(self):
-        H = self.H
-        # 2.3% per active hour, 9% used, 125 hours left: four agents' worth against 8 hours a day.
-        self.assertLess(pace(9, 125*H, 7*86400, 0, rate=2.3/H), 0.5)
-        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=2.3/H, duty=1/3), 0.85)
-        self.assertGreater(pace(9, 125*H, 7*86400, 0, rate=1.5/H, duty=1/3), 1.1)
-
-    def test_pace_ignores_expired_and_first_minutes(self):
-        self.assertIsNone(pace(10, -1, 5*self.H, 0))
-        self.assertIsNone(pace(1, 5*self.H - 600, 5*self.H, 0))
-        self.assertIsNotNone(pace(1, 5*self.H - 1000, 5*self.H, 0))
-        self.assertIsNone(pace(1, 6*self.H, 5*self.H, 0))
-
-    def test_reduction_is_immediate_even_during_recovery_cooldown(self):
-        signals = [('seven_day', 1.06, 1)]
-        self.assertEqual(auto_limit(6, 6, signals, 1001, 1000), (1, 1001))
-        self.assertEqual(auto_limit(1, 6, signals, 1002, 1001), (1, 1001))
-
-    def test_capacity_rounds_down_and_strictest_window_wins(self):
-        self.assertEqual(auto_limit(6, 6, [('five_hour', 2.9, 1)], 1000, 999), (2, 1000))
-        self.assertEqual(auto_limit(6, 6, [('five_hour', 4, 2), ('seven_day', 1.5, 2)], 1000, 999), (3, 1000))
-        self.assertEqual(auto_limit(6, 6, [('seven_day', 0.43)], 1000, 999), (2, 1000))
-
-    def test_recovery_requires_cooldown_and_headroom_for_new_slot(self):
-        enough = [('seven_day', 6.6, 1)]
-        self.assertEqual(auto_limit(1, 6, enough, AUTO_STEP - 1, 0), (1, 0))
-        self.assertEqual(auto_limit(1, 6, enough, AUTO_STEP, 0), (2, AUTO_STEP))
-        self.assertEqual(auto_limit(1, 6, [('seven_day', 2.05, 1)], AUTO_STEP, 0), (1, 0))
-        self.assertEqual(auto_limit(6, 6, enough, AUTO_STEP, 0, 8), (6, 0))
-        self.assertEqual(auto_limit(6, 6, [('seven_day', 8, 1)], AUTO_STEP, 0, 8), (7, AUTO_STEP))
 
     def test_continuous_ceiling_releases_budget_every_minute_and_ends_at_98(self):
         for length in (5*self.H, 7*24*self.H):
@@ -331,45 +281,83 @@ class AutoLimitTests(unittest.TestCase):
             self.assertEqual(line_cap(length, length, length+60), 98)
         self.assertEqual(line_cap(7*24*self.H, 7*24*self.H, 24*self.H), 14)
 
-    def test_two_points_of_margin_support_one_at_observed_rate(self):
-        length = 7*24*self.H
-        now = length * 86/98
-        p = line_pace(84, length, length, now, 1.09/self.H)
-        self.assertLess(p, 1)
-        self.assertEqual(auto_limit(6, 6, [('seven_day', p, 1.03)], now, now-1)[0], 1)
-        self.assertIsNone(line_until(84, length, length, now))
-        # Plenty of margin sustains all six at this same consumption per agent.
-        p = line_pace(55, length, length, now, 1.09/self.H)
-        self.assertEqual(auto_limit(6, 6, [('seven_day', p, 1.03)], now, now-1)[0], 6)
+    def test_active_rate_counts_only_working_time(self):
+        H, B = self.H, ACTIVITY_BUCKET
+        # 3% over 1.5 hours of work spread across 3 hours: 2% per active hour, not 1.
+        work = [t for t in range(0, 3*H, B) if t % H < H/2]
+        history = [(2, 0), (3, H), (4, 2*H), (5, 3*H - 1)]
+        self.assertAlmostEqual(recent_rate(history, 3*H, 'seven_day', work)*H, 2.0)
+        # Minimum history in active time: one working hour of readings at least.
+        self.assertIsNone(recent_rate([(2, 0), (9, 3*H)], 3*H, 'seven_day', work[:6]))
+        self.assertIsNone(recent_rate(history, 3*H, 'seven_day', []))
 
-    def test_line_allows_equality_and_waits_only_until_continuous_catchup(self):
-        for length in (5*self.H, 7*24*self.H):
-            self.assertIsNone(line_until(49, length, length, length/2))
-            self.assertAlmostEqual(line_until(50, length, length, length/2), length*50/98)
-            self.assertEqual(line_until(98, length, length, length-1), length)
-            self.assertIsNone(line_until(98, length, length, length))
-            self.assertIsNone(line_pace(0, length, length, length, None))
+    def test_capacity_spreads_what_is_left_over_the_working_time_left(self):
+        H, W = self.H, 7*86400
+        # 9% used, 125 hours left, 1%/h per agent: three agents at 8 hours a day, one around the clock.
+        now = W - 125*H
+        self.assertAlmostEqual(capacity(9, W, W, now, 1/H, 1/3), 88/(125/3), places=6)
+        self.assertAlmostEqual(capacity(9, W, W, now, 1/H), 88/125, places=6)
+        # Twice the burn per agent, half the agents.
+        self.assertAlmostEqual(capacity(9, W, W, now, 2/H, 1/3), 44/(125/3), places=6)
+        self.assertIsNone(capacity(9, W, W, W, 1/H))
+        self.assertIsNone(capacity(9, W, W, -1, 1/H))
 
-    def test_missing_or_flat_readings_do_not_unlock_all_slots(self):
-        length = 7*24*self.H
-        for rate in (None, 0):
-            p = line_pace(48.9, length, length, length/2, rate)
-            self.assertEqual(auto_limit(6, 6, [('seven_day', p, 1)], 1000, 0)[0], 1)
+    def test_capacity_never_outruns_the_continuous_ceiling(self):
+        H, W = self.H, 7*86400
+        # A renewed week at 8 hours a day would spread 2.9%/h, but the ceiling holds 1 point
+        # of tolerance plus what it releases in the next hour: 1.58 points.
+        self.assertAlmostEqual(capacity(0, W, W, 60, 1/H, 1/3), (1 + 98*60/W + 98*H/W), places=6)
+        # On the line with no tolerance left the ceiling allows only what it releases.
+        self.assertAlmostEqual(capacity(51, W, W, W/2, 1/H, 1/3), 98*H/W, places=6)
+        # The 5-hour window releases 19.6 points an hour: its ceiling seldom binds.
+        self.assertGreater(capacity(0, 5*H, 5*H, 60, 2/H), 9)
+
+    def test_reduction_is_immediate_even_during_recovery_cooldown(self):
+        signals = [('seven_day', 1.06)]
+        self.assertEqual(auto_limit(6, 6, signals, 1001, 1000), (1, 1001))
+        self.assertEqual(auto_limit(1, 6, signals, 1002, 1001), (1, 1001))
+
+    def test_capacity_rounds_down_and_strictest_window_wins(self):
+        self.assertEqual(auto_limit(6, 6, [('five_hour', 2.9)], 1000, 999), (2, 1000))
+        self.assertEqual(auto_limit(6, 6, [('five_hour', 8), ('seven_day', 3)], 1000, 999), (3, 1000))
+        self.assertEqual(auto_limit(6, 6, [('seven_day', 0.43)], 1000, 999), (1, 1000))
+
+    def test_recovery_requires_cooldown_and_headroom_for_new_slot(self):
+        enough = [('seven_day', 6.6)]
+        self.assertEqual(auto_limit(1, 6, enough, AUTO_STEP - 1, 0), (1, 0))
+        self.assertEqual(auto_limit(1, 6, enough, AUTO_STEP, 0), (2, AUTO_STEP))
+        self.assertEqual(auto_limit(1, 6, [('seven_day', 2.05)], AUTO_STEP, 0), (1, 0))
+        self.assertEqual(auto_limit(6, 6, enough, AUTO_STEP, 0, 8), (6, 0))
+        self.assertEqual(auto_limit(6, 6, [('seven_day', 8)], AUTO_STEP, 0, 8), (7, AUTO_STEP))
         self.assertEqual(auto_limit(1, 6, [], 1000, 0), (6, 0))
 
-    def test_week_long_feedback_simulation_stays_below_continuous_ceiling(self):
-        length = 7*24*self.H
-        used, limit, changed = 0.0, 6, -AUTO_STEP
-        # Deterministic steady workload, per-agent burn below the budget refill rate.
-        # Evaluate every minute, including startup, day boundaries and the final minute.
-        for now in range(0, length, 60):
-            self.assertIsNone(line_until(used, length, length, now))
-            p = line_pace(used, length, length, now, 0.4/self.H)
-            limit, changed = auto_limit(limit, 6, [('seven_day', p, 1)], now, changed)
-            used += limit * 0.4 / 60
-            self.assertLessEqual(used, line_cap(length, length, now+60) + 1e-8)
-        self.assertGreater(used, 95)
+    def test_line_tolerates_a_point_and_waits_only_until_continuous_catchup(self):
+        for length in (5*self.H, 7*24*self.H):
+            self.assertIsNone(line_until(50, length, length, length/2))  # One whole point of tolerance.
+            self.assertAlmostEqual(line_until(51, length, length, length/2), length*50/98)
+            self.assertIsNone(line_until(1, length, length, 60))  # A renewed window's first point.
+            self.assertAlmostEqual(line_until(2, length, length, 60), length/98)
+            self.assertEqual(line_until(98, length, length, length-1), length)
+            self.assertIsNone(line_until(98, length, length, length))
+
+    def test_week_long_simulation_reaches_98_without_pausing(self):
+        H, W = self.H, 7*86400
+        # Six agents wanted from 9:00 to 20:00 at 0.8%/h each, the week renewing on a
+        # Saturday at 18:00: the week sustains about 1.6 of them.
+        used, limit, changed, cuts, worked = 0.0, 6, -AUTO_STEP, 0, 0
+        for now in range(0, W, 60):
+            working = 9 <= (18 + now/H) % 24 < 20
+            reading = int(used)
+            self.assertIsNone(line_until(reading, W, W, now))
+            new, changed = auto_limit(limit, 6, [('seven_day', capacity(reading, W, W, now, 0.8/H, 11/24))], now, changed)
+            cuts += new < limit
+            limit = new
+            if working:
+                used += limit * 0.8 / 60
+                worked += limit
+        self.assertGreater(used, 96)
         self.assertLessEqual(used, 98)
+        self.assertLess(cuts, 10)
 
 
 class AutoQueueTests(unittest.TestCase):
@@ -422,9 +410,9 @@ class AutoQueueTests(unittest.TestCase):
 
     def test_over_the_weekly_line_pauses_until_it_passes(self):
         for k in 'ab': self.acquire(k)
-        self.usage(49, 24*3.5, kind='seven_day')  # Exactly on the line is allowed.
+        self.usage(50, 24*3.5, kind='seven_day')  # One point over the line is allowed.
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 1)
-        self.usage(50, 24*3.5, kind='seven_day')
+        self.usage(51, 24*3.5, kind='seven_day')
         status = self.q.operate({'op':'status'})
         self.assertEqual(status['limits']['agent'], 0)
         self.assertTrue(status['auto']['line'])
@@ -472,7 +460,7 @@ class AutoQueueTests(unittest.TestCase):
 
     def test_after_a_pause_the_maximum_returns_at_once_with_both_windows(self):
         self.usage(98, 0.5)
-        self.usage(30, 24*3, kind='seven_day')
+        self.usage(20, 24*3, kind='seven_day')
         self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 0)
         self.now += 5*60
         self.assertIn('paused_until', self.q.operate({'op':'acquire','key':'a','pool':'agent','session':'s','turn':'a','pid':10,'birth':'b'}))
@@ -509,10 +497,44 @@ class AutoQueueTests(unittest.TestCase):
         weekly(1)  # The upgraded account's window, or a stale response: wait for another.
         self.assertEqual(self.q.windows()[0]['percent'], 41)
         self.now += RESTART_CONFIRM
-        self.assertEqual(weekly(2)['limit'], 3)
+        # The pause is over; the restarted week sustains two at the startup guess.
+        self.assertEqual(weekly(2)['limit'], 2)
         self.assertEqual(self.q.windows()[0]['percent'], 2)
         self.assertIn('restart', (Path(self.temp.name)/'auto.log').read_text())
         self.assertEqual(self.q.db.execute('SELECT count(*) FROM usage_log').fetchone()[0], 1)
+
+    def test_a_renewed_week_inherits_the_rate_per_agent_it_ended_with(self):
+        H, B = self.H, ACTIVITY_BUCKET
+        old = self.now + 4*H
+        # Two agents working the last 4 hours of the week: 4 points, 0.5 per agent-hour.
+        for t in range(0, 4*H, B):
+            self.q.db.execute('INSERT INTO activity VALUES (?)', (self.now + t,))
+            self.q.db.execute('INSERT INTO load VALUES (?,2,1)', (self.now + t,))
+        for i in range(5):
+            self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':90 + i,'resets':old}]})
+            self.now += H - (i == 3)
+        self.now = old + 60
+        self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':0,'resets':old + 7*86400}]})
+        weekly = next(w for w in self.q.windows() if w['kind'] == 'seven_day')
+        self.assertEqual(weekly['source'], 'inherited')
+        self.assertAlmostEqual(weekly['rate'], 0.5, places=1)
+        share = weekly['hours'] / 24
+        self.assertGreater(weekly['agents'], capacity(0, old + 7*86400, 7*86400, self.now, 1/H, share))
+
+    def test_the_weekly_rate_follows_the_last_two_working_hours(self):
+        H = self.H
+        resets = self.now + 100*H
+        for t in range(-4*H, H, ACTIVITY_BUCKET):
+            self.q.db.execute('INSERT INTO activity VALUES (?)', (self.now + t,))
+            self.q.db.execute('INSERT INTO load VALUES (?,1,1)', (self.now + t,))
+        weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
+        start = self.now
+        self.now = start - 3*H; weekly(36)
+        self.now = start - H; weekly(37)
+        self.now = start + H; weekly(40)  # Three points in the last hour: the slow hours fall out.
+        w = next(w for w in self.q.windows() if w['kind'] == 'seven_day')
+        self.assertEqual(w['source'], 'measured')
+        self.assertAlmostEqual(w['rate'], 1.5, places=1)
 
     def test_a_stale_response_neither_restarts_nor_counts_as_burn(self):
         # An idle session reports 32% from hours ago, then a live one 38% six seconds later.
@@ -530,9 +552,9 @@ class AutoQueueTests(unittest.TestCase):
         weekly(32)
         self.assertEqual(self.q.windows()[0]['percent'], 38)
 
-    def test_a_burst_is_weighed_against_the_whole_week(self):
+    def test_a_burst_is_measured_per_agent_and_spread_over_learned_hours(self):
         H, B = self.H, ACTIVITY_BUCKET
-        # Ten working hours a day; 3%/h over the last three, 41% over the week's ~38 working hours.
+        # Ten working hours a day; 3%/h with three agents over the last two.
         resets = self.now + 78*H
         start = resets - 7*24*H
         days = [self.now - d*24*H for d in range(5)]  # The last one before the window began.
@@ -542,14 +564,13 @@ class AutoQueueTests(unittest.TestCase):
                 self.q.db.execute('INSERT OR IGNORE INTO load VALUES (?,6,2)', (t,))  # All 3 slots working.
         self.q.db.commit()
         weekly = lambda percent: self.q.operate({'op':'usage','readings':[{'kind':'seven_day','percent':percent,'resets':resets}]})
-        self.now -= 3*H; weekly(32)
-        self.now += 3*H; weekly(41)
+        self.now -= 2*H; weekly(35)
+        self.now += 2*H; weekly(41)
         w = self.q.windows()[0]
-        self.assertEqual(w['load'], 3)
-        self.assertAlmostEqual(w['rate'], 3.0, places=1)
-        self.assertLess(w['average'], 1.2)
-        self.assertGreater(w['pace'], 0.75)  # The burst alone would say 0.52.
-        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], 3)
+        self.assertAlmostEqual(w['rate'], 1.0, places=1)  # Per agent.
+        self.assertAlmostEqual(w['hours'], 10, delta=1.5)
+        self.assertAlmostEqual(w['agents'], capacity(41, resets, 7*24*H, self.now, 1/H, w['hours']/24), delta=0.1)
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], int(w['agents']))
 
     def test_working_time_is_recorded_and_outlives_a_reset(self):
         self.usage(9, 125, kind='seven_day')
@@ -565,7 +586,7 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.q.db.execute('SELECT count(*) FROM activity').fetchone()[0], 3)
         self.usage(9, 125, kind='seven_day')
         weekly = self.q.windows()[0]
-        self.assertIsNone(weekly['rate'])  # A restarted window waits for two working hours of readings.
+        self.assertEqual(weekly['source'], 'default')  # A restarted window waits for an hour of readings.
         self.assertGreater(weekly['hours'], 8)
 
     def test_agents_working_behind_the_rate_are_recorded(self):
@@ -579,7 +600,7 @@ class AutoQueueTests(unittest.TestCase):
             self.q.operate({'op':'touch','keys':['a','b'],'pid':10,'birth':'b'})
         five(14)
         # The measured interval contains four buckets with both; the earlier bucket saw 'a' alone (granting 'b') and once with both.
-        self.assertEqual(self.q.windows()[0]['load'], 2.0)
+        self.assertAlmostEqual(self.q.windows()[0]['rate'], 6.0)  # 4 points / (2 agents * 1/3 hour).
         first = int((self.now - 4*ACTIVITY_BUCKET) // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
         self.assertEqual(tuple(self.q.db.execute('SELECT agents,samples FROM load WHERE bucket=?', (first,)).fetchone()), (3, 2))
 

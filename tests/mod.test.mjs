@@ -248,29 +248,29 @@ test('usage windows are reported on measure and by the heartbeat, once per chang
   await h.handlers['session.measure'](h.$,{changed:['context'],rateLimits:[]},async()=>({}));
   assert.equal(h.calls.filter(c=>c.op==='usage').length,2);
 });
-test('slots shows the automatic limit and window pace',async()=>{
+test('slots shows the automatic limit and window capacity',async()=>{
   const h=harness(async()=>({limits:{agent:2},auto:{enabled:true,cap:3,target:95,
-    windows:[{kind:'five_hour',percent:82,elapsed:78,pace:0.62}]},tickets:[]}));
+    windows:[{kind:'five_hour',percent:82,elapsed:78,ceiling:76.44,margin:-5.56,agents:2.4,rate:3.1,source:'measured'}]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/Auto limit: 2 \(normal 3, max 3\), pacing to 95% per window; five_hour 82% used, 78% elapsed, pace 0.62/);
+  assert.match(r.text,/Auto limit: 2 \(normal 3, max 3\), pacing to 95% per window; five_hour 82% used, 78% elapsed, ceiling 76.44%, margin -5.56 pp, capacity 2.40 agents, 3.1%\/h per agent \(measured\)/);
 });
 test('slots distinguishes elapsed time from ceiling and available margin',async()=>{
   const h=harness(async()=>({limits:{agent:1},auto:{enabled:true,cap:6,target:98,
-    windows:[{kind:'seven_day',percent:84,elapsed:86,ceiling:84.28,margin:0.28,supported:0.55}]},tickets:[]}));
+    windows:[{kind:'seven_day',percent:84,elapsed:86,ceiling:84.28,margin:0.28,agents:0.55,rate:0.8,source:'inherited',hours:11}]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/84% used, 86% elapsed, ceiling 84.28%, margin 0.28 pp, capacity 0.55 agents/);
+  assert.match(r.text,/84% used, 86% elapsed, ceiling 84.28%, margin 0.28 pp, capacity 0.55 agents, 0.8%\/h per agent \(inherited\), ~11 h\/day working/);
 });
 test('slots explains a pause and when it ends',async()=>{
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,windows:[]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
   assert.match(r.text,/Paused: a usage window reached 95%; agents resume when it renews at .*"\/slots forget" or "\/slots auto off" resumes now/);
 });
-test('slots explains a pause over the weekly line and shows the line pace',async()=>{
-  const weekly={kind:'seven_day',percent:59,elapsed:58.1,rate:0.92,pace:1.1,load:1.5,line:0,line_load:2,hours:11.3,average:null};
+test('slots explains a pause over the weekly line and shows the capacity',async()=>{
+  const weekly={kind:'seven_day',percent:59,elapsed:58.1,ceiling:56.94,margin:-2.06,agents:0,rate:0.92,source:'measured',hours:11.3};
   const h=harness(async()=>({limits:{agent:0},auto:{enabled:true,cap:3,target:95,until:1792300000,line:true,windows:[weekly]},tickets:[]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
   assert.match(r.text,/Paused: continuous usage ceiling reached; agents resume when the ceiling catches up at /);
-  assert.match(r.text,/pace 1\.10 at 1\.5 agents, line pace 0\.00 at 2 agents/);
+  assert.match(r.text,/capacity 0\.00 agents, 0\.92%\/h per agent \(measured\), ~11\.3 h\/day working/);
 });
 test('a pause over the weekly line says so',async()=>{
   let n=0;const h=harness(async d=>d.op==='acquire'&&++n<3?{state:'queued',paused_until:1792300000,paused_line:true}:{state:'granted'});
@@ -388,14 +388,14 @@ test('a subagent step waiting close to the stall limit is admitted by force',asy
   const m=harness(async d=>{now+=200000;return {state:d.op==='acquire'&&acquires(m).length>4?'granted':'queued'};});
   await step(m);assert.ok(!acquires(m).some(c=>c.force));
 });
-test('slots shows the recent rate and any overdraft',async()=>{
+test('slots shows the rate per agent and any overdraft',async()=>{
   const h=harness(async()=>({limits:{agent:1},auto:{enabled:true,cap:3,max:3,target:95,
-    windows:[{kind:'five_hour',percent:26,elapsed:27,rate:3.9,pace:4.8},
-             {kind:'seven_day',percent:9,elapsed:26,rate:2.3,average:1.1,hours:9.8,pace:0.73}]},
+    windows:[{kind:'five_hour',percent:26,elapsed:27,ceiling:26.46,margin:0.46,agents:4.8,rate:3.9,source:'measured'},
+             {kind:'seven_day',percent:9,elapsed:26,ceiling:25.48,margin:16.48,agents:0.73,rate:2.3,source:'default',hours:9.8}]},
     tickets:[{seq:1,state:'granted',session:'s',pid:2,idle:0},{seq:2,state:'granted',session:'s',pid:2,idle:0}]}));
   const r=await h.handlers['command.run'](h.$,{command:'slots',args:''});
-  assert.match(r.text,/3.9%\/h lately, pace 4.80/);assert.match(r.text,/1 over the limit/);
-  assert.match(r.text,/2.3%\/h working lately, 1.1%\/h over the window, ~9.8 h\/day working, pace 0.73/);
+  assert.match(r.text,/capacity 4.80 agents, 3.9%\/h per agent \(measured\)/);assert.match(r.text,/1 over the limit/);
+  assert.match(r.text,/capacity 0.73 agents, 2.3%\/h per agent \(default\), ~9.8 h\/day working/);
 });
 
 const rotates=h=>h.calls.filter(c=>c.op==='rotate');

@@ -29,16 +29,15 @@ AGING = 300  # Seconds in line after which a ticket gets the priority of work un
 SPRINT_MAX = 60  # Minutes a sprint may last.
 TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
 LIVE = "state IN ('queued','granted')"
-# Continuous budget: both windows release 98% evenly from start to reset.
+# Each window's capacity is what is left of 98% spread over the working time left, never
+# more than keeps it within a point of a continuous ceiling that releases 98% evenly.
 WINDOWS = {'five_hour': 5 * 3600, 'seven_day': 7 * 86400}
 AUTO_TARGET = 98.0
 AUTO_STEP = 600     # Recovery only; unsafe concurrency is reduced on every operation.
-AUTO_WARMUP = 900   # Only the diagnostic end-of-window pace ignores startup noise.
 AUTO_IDLE = 3600
-AUTO_HEADROOM = 1.1  # A new slot needs 10% spare capacity.
-LINEAR = set(WINDOWS)
-LINE_HORIZON = {'five_hour': 3600, 'seven_day': 4 * 3600}
-LINE_RESERVE = 1.0  # Percentage point for coarse readings and calls already in flight.
+AUTO_HEADROOM = 1.1  # A new slot needs 10% spare capacity, so the limit does not flap.
+LINE_GUARD = 3600   # Seconds ahead the continuous ceiling must hold at the current capacity.
+LINE_RESERVE = 1.0  # Whole-point readings: the tolerance over the ceiling and the reserve under 98%.
 # Per-agent startup estimates, also used when a flat reading cannot measure consumption.
 DEFAULT_RATE = {'five_hour': 20 / 3600, 'seven_day': 1 / 3600}
 # A reading of the same window this many points under the stored one means the account's
@@ -51,10 +50,11 @@ RESTART_CONFIRM = 300
 
 # Recent burn rate: readings over this span, at least MIN apart (percent moves in whole points).
 # For ACTIVE windows both are seconds of activity, not of the clock.
-RATE_SPAN = {'five_hour': 3600, 'seven_day': 4 * 3600}
-RATE_MIN = {'five_hour': 600, 'seven_day': 2 * 3600}
-# Windows measured per active hour (any agent working on this machine) and projected over
-# the hours a day worked lately: nights and days off neither dilute nor inflate the rate.
+RATE_SPAN = {'five_hour': 3600, 'seven_day': 2 * 3600}
+RATE_MIN = {'five_hour': 600, 'seven_day': 3600}
+# Windows measured per active hour (any agent working on this machine) and spread over
+# the hours a day worked lately, learned from activity: nights and days off neither
+# dilute nor inflate the rate, and a machine working around the clock learns 24 hours.
 ACTIVE = {'seven_day'}
 ACTIVITY_BUCKET = 300  # Seconds: an agent working at any moment of one marks all of it active.
 DUTY_SPAN = 7 * 86400  # Hours a day are learned from the last week,
@@ -115,70 +115,52 @@ def rate_load(history, now, kind, buckets, loads):
     return load
 
 
-def pace(percent, resets, length, now, target=AUTO_TARGET, rate=None, duty=1.0):
-    """How sustainable usage is: 1 on pace to end at target, below 1 too fast.
-
-    With a recent burn rate: the budget left over what that rate spends in the
-    time left, of which only the share `duty` is active (a rate per active
-    second). It follows the current load, so the limit recovers once usage
-    slows. Without one, the share of budget left over the share of time left.
-    None when the reading cannot be judged: expired, malformed, or too early.
-    """
-    seconds_left = resets - now
-    left = seconds_left / length
-    if not 0 < left <= 1 - AUTO_WARMUP / length:
-        return None
-    budget = max(0.0, target - percent)
-    if rate is not None:
-        result = budget / (rate * duty * seconds_left) if rate > 0 else float('inf')
-    else:
-        result = budget / target / left
-    return result
-
-
 def line_cap(resets, length, now):
     """The explicit continuous ceiling, in percentage points (never rounded for control)."""
     return AUTO_TARGET * min(1.0, max(0.0, (now - (resets - length)) / length))
 
 
-def line_pace(percent, resets, length, now, rate, duty=None):
-    """Allowed burn / measured burn. Save a point of margin, spend the rest over a
-    lookahead, and include budget released during that lookahead. No daily steps or
-    assumption that the machine will stop overnight. `duty` is kept for old callers.
+def capacity(percent, resets, length, now, per_agent, share=1.0):
+    """Agents a window sustains, burning `per_agent` percent per agent-second of work.
+
+    The lesser of two: what is left of 98% (less a point for whole-point readings)
+    spread over the working time left, `share` of the clock; and what stays within
+    a point of the continuous ceiling for the next LINE_GUARD seconds. None outside
+    the window.
     """
     if not resets - length <= now < resets:
         return None
-    kind = next(k for k, seconds in WINDOWS.items() if seconds == length)
-    horizon = min(LINE_HORIZON[kind], resets - now)
-    margin = line_cap(resets, length, now) - percent
-    allowance = AUTO_TARGET / length + max(0.0, margin - LINE_RESERVE) / horizon
-    return allowance / (rate if rate is not None and rate > 0 else DEFAULT_RATE[kind])
+    left = resets - now
+    spread = max(0.0, AUTO_TARGET - LINE_RESERVE - percent) / (share * left)
+    guard = min(LINE_GUARD, left)
+    within = max(0.0, line_cap(resets, length, now) + LINE_RESERVE - percent) / guard + AUTO_TARGET / length
+    return min(spread, within) / per_agent
 
 
 def line_until(percent, resets, length, now):
     """Emergency backstop only above the continuous ceiling, or at the final target.
-    Equality with the moving line is allowed; an overshoot resumes when it catches up.
+    Readings are whole points, so one point over the moving line (LINE_RESERVE) is
+    allowed: a renewed window's first 1% is not an overshoot. An overshoot resumes
+    when the line is back within that point.
     """
     if not resets - length <= now < resets:
         return None
     if percent >= AUTO_TARGET:
         return resets
-    if percent <= line_cap(resets, length, now) + 1e-9:
+    if percent <= line_cap(resets, length, now) + LINE_RESERVE + 1e-9:
         return None
-    return min(resets, resets - length + percent / AUTO_TARGET * length)
+    return min(resets, resets - length + (percent - LINE_RESERVE) / AUTO_TARGET * length)
 
 
 def auto_limit(current, cap, signals, now, changed, ceiling=None):
     """Cut directly to sustainable concurrency, even within the recovery cooldown.
-    Signals are (kind, allowed/measured burn, measured agents). Unknown load means
-    the signal describes `cap` agents. Recovery adds one slot with 10% headroom.
-    A sub-unit capacity keeps one agent; only an actual ceiling breach pauses it.
+    Signals are (kind, agents the window sustains). Recovery adds one slot with 10%
+    headroom. A sub-unit capacity keeps one agent; only an actual ceiling breach pauses it.
     """
     ceiling = max(cap, ceiling or cap)
     if not signals:
         return cap, changed
-    supported = min(p * (load[0] if load and load[0] is not None else cap)
-                    for _, p, *load in signals)
+    supported = min(agents for _, agents in signals)
     safe = ceiling if math.isinf(supported) else max(1, min(ceiling, math.floor(supported + 1e-9)))
     current = max(1, min(current, ceiling))
     if safe < current:
@@ -380,43 +362,46 @@ class Queue:
             history = self.db.execute('SELECT percent,at FROM usage_log WHERE kind=? AND abs(resets-?)<=60 ORDER BY at',
                                       (r['kind'], r['resets'])).fetchall()
             active = r['kind'] in ACTIVE
-            rate = recent_rate([tuple(h) for h in history], now, r['kind'], buckets if active else None)
-            average = None
-            start = r['resets'] - WINDOWS[r['kind']]
-            if active and first is not None and first <= start:
-                worked = active_time(buckets, start, now + ACTIVITY_BUCKET)
-                average = r['percent'] / worked if worked >= RATE_MIN[r['kind']] else None
-            # A burst of a few hours is not the week: the recent rate counts half, the window's
-            # own (all its working hours) the other half.
-            judged = rate if rate is None or average is None else (rate + average) / 2
-            # Normalize the rate by agents over exactly its observation interval.
-            load = rate_load([tuple(h) for h in history], now, r['kind'], buckets, loads) if rate is not None else None
-            line_load = load
-            if load is not None and average is not None:
-                whole = concurrency(buckets[bisect_left(buckets, start):], loads)
-                solo = (rate / load + average / whole) / 2
-                load = judged / solo if solo > 0 else load
+            history = [tuple(h) for h in history]
+            rate = recent_rate(history, now, r['kind'], buckets if active else None)
+            # Per agent-second of work: the rate over the agents behind exactly its interval.
+            load = rate_load(history, now, r['kind'], buckets, loads) if rate else None
+            per_agent, source = (rate / (load or 1.0), 'measured') if rate else (None, None)
+            if per_agent is None:
+                # A flat or new window cannot measure consumption: each agent burns what it did
+                # at the end of the window before, or the startup guess.
+                per_agent, source = self._inherited(r['kind'], r['resets'], buckets, loads), 'inherited'
+                if per_agent is None:
+                    per_agent, source = DEFAULT_RATE[r['kind']], 'default'
+            length = WINDOWS[r['kind']]
             window = {'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
-                      'elapsed': round(100 * (1 - (r['resets'] - now) / WINDOWS[r['kind']]), 1),
-                      # Percent per hour; per active hour for ACTIVE windows.
-                      'rate': None if rate is None else round(rate * 3600, 2),
-                      'pace': pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate=judged,
-                                   duty=share if active else 1.0),
-                      'load': None if load is None else round(load, 2)}
-            if r['kind'] in LINEAR:
-                # The current margin plus newly released budget, using the recent rate.
-                window['line'] = line_pace(r['percent'], r['resets'], WINDOWS[r['kind']], now, rate,
-                                           share if active else None)
-                window['line_load'] = line_load if rate is not None and rate > 0 and line_load else 1.0
-                window['ceiling'] = line_cap(r['resets'], WINDOWS[r['kind']], now)
-                window['margin'] = window['ceiling'] - r['percent']
-                window['supported'] = window['line'] * window['line_load'] if window['line'] is not None else None
-                window['line_until'] = line_until(r['percent'], r['resets'], WINDOWS[r['kind']], now)
+                      'elapsed': round(100 * (1 - (r['resets'] - now) / length), 1),
+                      # Percent per agent-hour of work, and where it comes from.
+                      'rate': round(per_agent * 3600, 2), 'source': source,
+                      'agents': capacity(r['percent'], r['resets'], length, now, per_agent,
+                                         share if active else 1.0),
+                      'ceiling': line_cap(r['resets'], length, now),
+                      'line_until': line_until(r['percent'], r['resets'], length, now)}
+            window['margin'] = window['ceiling'] - r['percent']
             if active:
-                window['hours'] = round(24 * share, 1)  # Active hours a day the rate is projected over.
-                window['average'] = None if average is None else round(average * 3600, 2)
+                window['hours'] = round(24 * share, 1)  # Learned hours a day the budget is spread over.
             result.append(window)
         return result
+
+    def _inherited(self, kind, resets, buckets, loads):
+        """Percent per agent-second the previous window of `kind` ended with, if it ended
+        within one window before this one started; None otherwise. History lasts 2 days."""
+        length = WINDOWS[kind]
+        previous = self.db.execute('SELECT max(resets) FROM usage_log WHERE kind=? AND resets<=?',
+                                   (kind, resets - length + 60)).fetchone()[0]
+        if previous is None or previous < resets - 2 * length:
+            return None
+        history = [tuple(h) for h in self.db.execute(
+            'SELECT percent,at FROM usage_log WHERE kind=? AND abs(resets-?)<=60 ORDER BY at', (kind, previous))]
+        end = history[-1][1]
+        rate = recent_rate(history, end, kind, buckets if kind in ACTIVE else None)
+        load = rate_load(history, end, kind, buckets, loads) if rate else None
+        return rate / load if rate and load else None
 
     def note(self, entry, log=None):
         try:
@@ -443,7 +428,7 @@ class Queue:
         if self.auto:
             now = self.clock()
             windows = [w for w in self.windows() if w['resets'] > now]
-            signals = [(w['kind'], w['line'], w['line_load']) for w in windows if w.get('line') is not None]
+            signals = [(w['kind'], w['agents']) for w in windows if w['agents'] is not None]
             previous = int(value.get('limit', self.cap))
             spent = [w['resets'] for w in windows if w['percent'] >= AUTO_TARGET]
             if spent:
@@ -464,10 +449,8 @@ class Queue:
                         limit, changed = step, now
             if limit != previous:
                 self.note({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
-                           'paces': {k: round(p, 2) for k, p, _ in signals},
-                           'loads': {k: l for k, _, l in signals if l is not None},
-                           'budgets': {w['kind']: {k: w[k] for k in ('ceiling', 'margin', 'supported')}
-                                       for w in windows if 'ceiling' in w}})
+                           'windows': {w['kind']: {k: w[k] for k in ('percent', 'agents', 'rate', 'source', 'margin')}
+                                       for w in windows}})
             self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
             # Emergency ceiling breach: retain the reduced limit for recovery.
             behind = [w['line_until'] for w in windows if w.get('line_until') and w['percent'] < AUTO_TARGET]
