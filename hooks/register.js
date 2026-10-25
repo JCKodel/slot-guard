@@ -4,10 +4,10 @@ const IDLE_MS=120000;      // A ticket nobody is using this long is released.
 const ASK_GRACE_MS=15000;  // An ask still open this long waits for the person, not auto mode's classifier.
 const FORGET_MS=600000;    // Unused agent states are dropped after this.
 const PARK_MS=60000;       // A parent's slot left for its subagent goes back to the pool after this.
-// Claude Code fails a subagent whose model step shows no progress for 600 s, counted
-// from the step's start. Request an override after seven minutes; the coordinator
-// permits it only in manual mode. Automatic budgets must not be bypassed.
-const FORCE_MS=420000;
+// Claude Code's stall watchdog aborts a subagent 600 s after its last stream chunk, and a
+// step waiting for a slot streams nothing. An empty text chunk at this interval keeps a
+// queued subagent alive (measured: the watchdog counts any chunk; the engine keeps none).
+const KEEPALIVE_MS=60000;
 const SPRINT_MINUTES=5;    // Default length of "/slots sprint".
 const instance=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10);
 const emptyStep = e => ({turnId:e.turnId,index:e.index,answer:'',toolUses:[],stopReason:null,usage:null});
@@ -21,19 +21,22 @@ async function call($, data) {
   return result;
 }
 // Resolves true when granted, false when the ticket was released (canceled, evicted, expired).
-async function acquire($, ticket, signal, registry, forceAfter, once={}) {
+// A subagent's step (`subagent`) reports when it began waiting: the coordinator serves it
+// first once it has waited long, and holders yield to it at their next tool. `onWait` is
+// called after each poll that found the ticket still queued.
+async function acquire($, ticket, signal, registry, subagent, once={}, onWait=null) {
   let first=true, paused=false;
   const since=Date.now();
   for (;;) {
     signal.throwIfAborted();
-    const force=forceAfter!=null && Date.now()-since>=forceAfter;
     const r=await call($,{...ticket,op:'acquire',wait:first?0:15,
-      ...(force?{force:true}:{}),...(first?once:{})});
+      ...(subagent?{step:since/1000}:{}),...(first?once:{})});
     first=false;
     if(r.paused_until) {registry.pausedUntil=r.paused_until*1000; registry.pausedLine=!!r.paused_line;}
     signal.throwIfAborted();
     if(r.state==='granted') {if(paused) $.ui.status(undefined); return true;}
     if(r.state!=='queued') return false;
+    if(onWait) onWait();
     if(r.paused_until && !paused) {
       paused=true;
       $.ui.status(`Slot Guard: paused until ${new Date(r.paused_until*1000).toLocaleTimeString()}, `+
@@ -84,7 +87,7 @@ const between = state => state.busy===0 && state.steps===0;
 async function offer($,state) {
   if(state.ticket && between(state)) await call($,{op:'rotate',keys:[state.ticket.key]}).catch(()=>{});
 }
-async function enter($,state,signal,step=false) {
+async function enter($,state,signal,step=false,onWait=null) {
   return locked(state,async()=>{
     if(state.closed) throw new Error('Agent turn already ended');
     if(!step) {await offer($,state); state.busy++; state.active=Date.now(); return;}
@@ -101,7 +104,7 @@ async function enter($,state,signal,step=false) {
       state.registry.held.add(state);
       let granted;
       state.acquiring=true;
-      try {granted=await acquire($,state.ticket,signal,state.registry,state.agent!=='main' ? FORCE_MS : null,once);}
+      try {granted=await acquire($,state.ticket,signal,state.registry,state.agent!=='main',once,onWait);}
       catch(error) {await release($,state); throw error;}
       finally {state.acquiring=false;}
       if(granted) break;
@@ -238,7 +241,7 @@ async function status($,s) {
   for(const [session,until] of sprints)
     auto.push(`Sprint: ${session==='*'?'every session':'session '+session.slice(0,8)} starts its agents at once until ${new Date(until*1000).toLocaleTimeString()}. "/slots sprint off" ends it.`);
   const over=count('granted')-s.limits.agent;
-  if(over>0) auto.push(`${over} over the limit: ${sprints.length?'a sprint, or ':''}calls admitted before the limit fell, or a manual-mode override; nothing new starts until they finish.`);
+  if(over>0) auto.push(`${over} over the limit: ${sprints.length?'a sprint, or ':''}calls admitted before the limit fell; nothing new starts until they finish.`);
   return [`Agents: ${count('granted')}/${s.limits.agent} working; ${count('queued')} waiting (FIFO). Parents waiting only for children yield their slot. "/slots help" lists the subcommands.`,...auto,...lines].join('\n');
 }
 export function register(on) {
@@ -336,7 +339,20 @@ export function register(on) {
     let entered=false;
     try {
       await flush($,registry.orphans);
-      await enter($,state,next.signal,true); entered=true;
+      if(e.agentId) {
+        // A subagent waiting for its slot streams an empty chunk a minute, or the stall
+        // watchdog aborts it. Each poll of the queue wakes this loop; the grant ends it.
+        let wake=null, settled=false, failure=null;
+        const notify=()=>{if(wake) {const w=wake; wake=null; w();}};
+        enter($,state,next.signal,true,notify).then(()=>{settled=true; notify();},error=>{failure=error; settled=true; notify();});
+        let last=Date.now();
+        while(!settled) {
+          await new Promise(resolve=>{wake=resolve;});
+          if(!settled && Date.now()-last>=KEEPALIVE_MS) {yield {kind:'text',index:0,text:''}; last=Date.now();}
+        }
+        if(failure) throw failure;
+      } else await enter($,state,next.signal,true);
+      entered=true;
       return yield* next(e);
     } catch(error) {
       // An abandoned dispatch (interrupt, reload) has already moved on: do not stop the turn again.

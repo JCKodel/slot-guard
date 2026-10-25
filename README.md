@@ -99,7 +99,7 @@ The ceiling grows every second and ends at 98%. The weekly budget releases exact
 - **Gradual recovery:** add at most one slot every ten minutes, only if both windows support the new concurrency with 10% headroom. After an hour idle, recovery can settle immediately at the supported limit. A configured `max` uses the same capacity rule.
 - **Rates without spend:** recent weekly consumption is measured per working hour over up to two working hours, with at least one hour of history. The five-hour rate uses up to one clock hour, with at least ten minutes of history. Measured concurrency over the same interval converts each rate to consumption per agent; idle time is included in both the five-hour rate and its mean load. A renewed or flat window uses the consumption per agent its previous window ended with; without one, startup estimates of 1 percentage point per agent-hour weekly and 20 per agent-hour for the five-hour window. Without any valid usage reading, the configured normal limit applies.
 - **Emergency protection:** usage more than one point above the moving ceiling (readings are whole points; the ceiling is never under 1%, so a renewed window's first 2% are not an overshoot) pauses admission only until the ceiling is back within that point. At 98%, admission pauses until reset. These are backstops, not the desired operating pattern. One agent may itself consume faster than the released budget; concurrency alone cannot guarantee uninterrupted work in that case. Delayed readings, workload changes, in-flight calls, and usage elsewhere can also cause overshoot. `/slots` exposes capacity below one instead of hiding this constraint.
-- **No automatic overdraft:** a waiting subagent cannot exceed the automatic limit to avoid Claude Code's stall timeout. It may time out while queued. Explicit sprints remain a user-requested override of concurrency (not of a ceiling pause); avoid them when preserving the budget.
+- **No automatic overdraft:** a waiting subagent never exceeds the limit. It stays alive in the queue (see below) and goes first once it has waited two minutes. Explicit sprints remain a user-requested override of concurrency (not of a ceiling pause); avoid them when preserving the budget.
 - **Reset and plan changes:** `/slots reset` keeps readings and immediately reapplies the budget. `/slots forget` clears readings; a later report restores protection. A drop of more than five points for the same reset time must persist for five minutes before being treated as a plan change. `readings.log` survives both commands.
 
 Every limit change is recorded in `auto.log`. Restart all participating Claude sessions after updating so older coordinators cannot grant using the previous policy.
@@ -116,15 +116,18 @@ python3 guard.py status                 # limit, maximum, and each window's usag
 
 ### Subagents and the 10-minute stall limit
 
-Claude Code fails a subagent whose model step shows no progress for 600 seconds. Waiting in the queue counts as no progress, so Slot Guard reduces that wait where the budget permits:
+Claude Code's stall watchdog aborts a subagent 600 seconds after its last stream chunk, and a step waiting in the queue streams nothing. Slot Guard keeps queued subagents alive and shortens their wait:
 
+- **Keepalive:** a subagent waiting for its slot streams an empty chunk every minute. The watchdog counts it as progress and the engine keeps no trace of it, so a subagent can wait as long as the queue takes. Measured on Claude Code 2.1.310 (`scripts/stall_probe.py`): a subagent silent for 600 s is aborted (`stall watchdog fired after 600000ms with no progress`), one streaming an empty chunk a minute is not; a subagent that streamed two empty chunks before a real model call (haiku and sonnet) ran a tool and answered on its next call, with no empty block in its transcript.
 - **Handoff:** a parent waiting for its subagent hands it its slot directly; the first subagent starts at once. If none takes it within a minute, the slot returns to the pool (or to the parent when it resumes).
 - **Work under way first:** subagents and resumed turns queue ahead of new prompts.
-- **Manual-mode overdraft:** a subagent that has waited 7 minutes is admitted even over the limit, leaving the model 3 minutes to start answering before the 10-minute stall limit. Nothing new starts until the pool is back under the limit; `/slots` shows `N over the limit` and `auto.log` records each one. Automatic mode rejects this override to preserve the calculated concurrency.
+- **Urgency:** a subagent step that has waited two minutes goes to the front of the queue, the longest waiting first, and whoever holds a slot hands it over at its next tool, even within its quantum. A model call already running is never interrupted, so that handover comes when the call ends; with one slot and several sessions, that is the finest slice there is.
+
+No subagent is ever admitted over the limit for this; the manual-mode overdraft of earlier versions is gone.
 
 ### Taking turns (cooperative multitasking)
 
-The limit controls agents admitted to model calls, which spend usage. Tools run on the agent's ticket whether it is granted or waiting. Between calls, an agent that has held its slot for the quantum (60 seconds by default) yields to a queued agent. When the automatic limit falls, excess agents yield before their next call even if their quantum has not expired and nobody else was waiting. Calls already running are never interrupted, so concurrency can temporarily exceed a newly reduced limit until they reach that boundary. Explicit sprints and manual-mode overdrafts also allow extra concurrency. An agent waiting five minutes gets the same priority as work under way to reduce starvation; this does not guarantee avoiding Claude Code's stall timeout under heavy contention.
+The limit controls agents admitted to model calls, which spend usage. Tools run on the agent's ticket whether it is granted or waiting. Between calls, an agent that has held its slot for the quantum (60 seconds by default) yields to a queued agent. When the automatic limit falls, excess agents yield before their next call even if their quantum has not expired and nobody else was waiting. When a subagent has waited two minutes, the holder yields at its next tool whatever its quantum. Calls already running are never interrupted, so concurrency can temporarily exceed a newly reduced limit until they reach that boundary. Explicit sprints also allow extra concurrency. An agent waiting five minutes gets the same priority as work under way to reduce starvation.
 
 
 With `n` agents sharing one slot, each waits about `(n − 1) × quantum` between turns. Up to five agents that stays under the 5-minute prompt-cache lifetime of subagents; with more, a longer quantum avoids cache rebuilds at the cost of longer turns.
@@ -223,6 +226,7 @@ claude plugin validate --strict .
 claude plugin validate --strict .claude-plugin/plugin.json
 python3 scripts/smoke_install.py
 python3 scripts/package.py
+python3 scripts/stall_probe.py   # measures the subagent stall watchdog with a fixture model (11 min)
 ```
 
 See [architecture](docs/architecture.md), [contributing](CONTRIBUTING.md), [release procedure](docs/releasing.md), and [security](SECURITY.md). This is an independent community project, not affiliated with Anthropic.

@@ -400,14 +400,32 @@ test('new prompts queue behind work under way',async()=>{
   const h=harness();await step(h);await step(h,{turnId:'c',agentId:'c',index:0});
   assert.deepEqual(acquires(h).map(c=>c.rank),[1,0]);
 });
-test('a subagent step waiting close to the stall limit is admitted by force',async(t)=>{
+test('a subagent step waiting in the queue streams an empty chunk a minute and reports its start',async(t)=>{
   let now=Date.now();t.mock.method(Date,'now',()=>now);
-  const h=harness(async d=>{if(d.op!=='acquire') return {};now+=200000;return {state:d.force?'granted':'queued'};});
-  await step(h,{turnId:'c',agentId:'c',index:0});
-  const sent=acquires(h);assert.ok(sent.at(-1).force);assert.ok(!sent[0].force);assert.equal(sent.at(-1).wait,15);
-  assert.ok(sent.slice(1,-1).every(c=>c.wait<=15));
-  const m=harness(async d=>{now+=200000;return {state:d.op==='acquire'&&acquires(m).length>4?'granted':'queued'};});
-  await step(m);assert.ok(!acquires(m).some(c=>c.force));
+  const start=now/1000;
+  // Eight polls of 15 s find it queued (two minutes); the ninth grants it.
+  let polls=0;
+  const h=harness(async d=>{if(d.op!=='acquire') return {};now+=15000;return {state:++polls>=9?'granted':'queued'};});
+  const chunks=[];
+  const g=h.handlers['turn.step'](h.$,{turnId:'c',agentId:'c',index:0},next(async function*(){yield {kind:'text',index:0,text:'answer'};return {};}));
+  for(;;){const n=await g.next();if(n.done)break;chunks.push(n.value);}
+  assert.deepEqual(chunks.map(c=>c.text),['','','answer']);
+  assert.ok(acquires(h).every(c=>c.step===start&&!('force' in c)));
+  // A main agent waits silently, and reports no step.
+  polls=0;const m=harness(async d=>{if(d.op!=='acquire') return {};now+=15000;return {state:++polls>=9?'granted':'queued'};});
+  const main=[];const gm=m.handlers['turn.step'](m.$,event,next(async function*(){yield {kind:'text',index:0,text:'answer'};return {};}));
+  for(;;){const n=await gm.next();if(n.done)break;main.push(n.value);}
+  assert.deepEqual(main.map(c=>c.text),['answer']);
+  assert.ok(acquires(m).every(c=>!('step' in c)));
+});
+test('a subagent whose wait is interrupted streams nothing and never enters the model',async()=>{
+  const controller=new AbortController();let called=0;
+  const h=harness(async d=>{if(d.op==='acquire'){controller.abort();return {state:'queued'};}return {};});
+  const fn=async function*(){called++;};fn.signal=controller.signal;
+  const chunks=[];const g=h.handlers['turn.step'](h.$,{turnId:'c',agentId:'c',index:0},fn);
+  for(;;){const n=await g.next();if(n.done)break;chunks.push(n.value);}
+  assert.equal(called,0);assert.deepEqual(chunks,[]);
+  assert.ok(h.calls.some(c=>c.op==='release'));
 });
 test('slots shows the rate per agent and any overdraft',async()=>{
   const h=harness(async()=>({limits:{agent:1},auto:{enabled:true,cap:3,max:3,target:95,

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.1-beta.1
+
+- Subagents no longer die waiting for a slot. Claude Code's stall watchdog aborts a subagent 600 s after its last stream chunk, and a queued step streams nothing: with one slot and four sessions, a subagent waited 10 minutes behind a long model call and was aborted. A waiting subagent now streams an empty chunk every minute; measured on Claude Code 2.1.310, the watchdog counts it as progress and the engine keeps no trace of it. The manual-mode overdraft after seven minutes is gone with the need for it: nothing is admitted over the limit but a sprint.
+- Finer slicing for subagents: a subagent step that has waited two minutes goes to the front of the queue, the longest waiting first, and whoever holds a slot hands it over at its next tool however short its quantum. Only a tool boundary preempts, so a holder always gets the model call it was granted for; a call already running is never interrupted. `/slots quantum N` still sets how long everyone else keeps a slot while others wait.
+
 ## 0.7.0-beta.1
 
 - Consumption is learned from spend. The mod reports how many dollars each session's API responses cost as Claude Code prices them (the figure `/cost` shows), and the coordinator learns how many points of each window a dollar takes, over the last seven days and across windows, nights and resets. On the maintainer's machine a point took $5–7 of the five-hour window and $23–25 of the week, steady hour after hour, where points per agent-hour varied fivefold with idle agents, long tools and context size: that variation is what made the limit too strict one day and too loose the next. A renewed window no longer starts from a 20-points-per-agent-hour guess: back after a night at 1% of the week, with the ceiling at 11%, it was 1 slot and is now 3.

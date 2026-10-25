@@ -224,6 +224,26 @@ print(json.dumps(local_call(Path(sys.argv[1]),json.loads(sys.argv[2]))))'''
         self.assertEqual(self.status(),[])
         print('Four parents / twelve children completed; peak working agents:',peak,flush=True)
 
+    def test_subagents_waiting_past_a_minute_for_one_slot_survive_and_finish(self):
+        # One slot, three children of 35 s each: the third waits 70 s, past the keepalive
+        # interval, and the real engine must accept the empty chunk streamed meanwhile.
+        # The parent's two steps (after spawning, and on the children's notification) take
+        # 35 s each too: about 175 s in all.
+        initialize(self.home, 1, replace=True)
+        sid,p=self.claude(delay=35,children=True)
+        end=time.monotonic()+300
+        peak=0
+        while p.poll() is None:
+            self.assertLess(time.monotonic(),end,'Children of one parent did not finish on one slot')
+            peak=max(peak,sum(t['state']=='granted' for t in self.status()))
+            time.sleep(.5)
+        r=self.result(p)
+        self.assertEqual(r['subagent_stats']['completed'],3)
+        self.assertEqual(peak,1)
+        log=(self.home/(sid+'.debug.log')).read_text()
+        self.assertNotIn('watchdog',log)
+        self.assertNotIn('hook skipped',log)
+
     def test_heartbeat_renews_lease_of_long_running_work(self):
         sid,p=self.claude(delay=4,heartbeat=500)
         renewals=set()

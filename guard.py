@@ -26,6 +26,10 @@ DEFAULT_AGENTS = 3  # Lasts a 5-hour window on Claude Max 5x; see README.
 LEASE = 300  # Seconds without renewal before a heartbeating ticket is abandoned.
 QUANTUM = 60  # Seconds an agent keeps its slot before yielding it to one that waits.
 AGING = 300  # Seconds in line after which a ticket gets the priority of work under way.
+# Claude Code fails a subagent whose model step shows no progress for 600 s. A subagent step
+# queued this long is urgent: it goes first, and a holder yields at its next tool boundary
+# (after the model call it is in) however short its quantum has been.
+URGENT = 120
 SPRINT_MAX = 60  # Minutes a sprint may last.
 TOMBSTONE = 3600  # Released tickets outlive any delayed acquire by far.
 LIVE = "state IN ('queued','granted')"
@@ -378,8 +382,13 @@ class Queue:
             # When the slot was granted, and the queue position after a rotation (else seq).
             self.db.execute('ALTER TABLE tickets ADD COLUMN since REAL')
             self.db.execute('ALTER TABLE tickets ADD COLUMN pos INTEGER')
-        if 'waited' not in {r['name'] for r in self.db.execute('PRAGMA table_info(tickets)')}:
+        columns = {r['name'] for r in self.db.execute('PRAGMA table_info(tickets)')}
+        if 'waited' not in columns:
             self.db.execute('ALTER TABLE tickets ADD COLUMN waited REAL')  # Back in line since (rotation).
+        if 'step' not in columns:
+            # When a queued subagent's model step began waiting (reported by the mod with each
+            # acquire); urgent URGENT seconds on. Cleared by a grant or a rotation.
+            self.db.execute('ALTER TABLE tickets ADD COLUMN step REAL')
         self.db.commit()
 
     def reap(self):
@@ -575,9 +584,24 @@ class Queue:
         sprints = self.sprints()
         return '*' in sprints or session in sprints
 
+    @staticmethod
+    def _order(now):
+        """Queue order: urgent subagent steps first, the longest waiting (nearest the stall
+        limit) ahead; then rank, then position. The ORDER BY clause and its parameters."""
+        urgent = now - URGENT
+        return ('ORDER BY CASE WHEN step<=? THEN 0 ELSE 1 END, CASE WHEN step<=? THEN step ELSE 0 END, '
+                'rank, coalesce(pos, seq)', (urgent, urgent))
+
+    def _queue(self, pool, now):
+        """Keys of the pool's queued tickets, in the order they are granted."""
+        order, params = self._order(now)
+        return [r[0] for r in self.db.execute(f"SELECT key FROM tickets WHERE pool=? AND state='queued' {order}",
+                                              (pool, *params))]
+
     def _promote(self):
         self._control()
         sprints = self.sprints()
+        now = time.time()
         for pool, limit in self.limits.items():
             if limit == 0:
                 # Working agents wait at their next step or tool, keeping their FIFO places.
@@ -593,16 +617,17 @@ class Queue:
                     (time.time(), pool, '*' in sprints, *sprints))
             used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (pool,)).fetchone()[0]
             free = max(0, limit - used)
-            self.db.execute("""UPDATE tickets SET state='granted', since=? WHERE seq IN
-                (SELECT seq FROM tickets WHERE pool=? AND state='queued' ORDER BY rank, coalesce(pos, seq) LIMIT ?)""",
-                (time.time(), pool, free))
+            for key in self._queue(pool, now)[:free]:
+                self.db.execute("UPDATE tickets SET state='granted', since=?, step=NULL WHERE key=?", (now, key))
 
-    def _rotate(self, key, now):
+    def _rotate(self, key, now, preempt=False):
         """Cooperative multitasking: a slot held for a quantum goes to the next in line.
 
         The agent keeps its ticket, queued behind every agent waiting now (rank 1: an
         agent's first grant of a turn still goes first). Excess grants yield even without waiters.
-        The caller must only rotate an agent between model calls.
+        The caller must only rotate an agent between model calls. With `preempt` (a tool
+        boundary: the holder has just finished a model call) an urgent subagent step waiting
+        takes the slot however short the quantum has been, so that it survives.
         """
         row = self.db.execute('SELECT seq,pool,session,since FROM tickets WHERE key=? AND state=?', (key, 'granted')).fetchone()
         if not row or self._sprinting(row['session']):
@@ -610,13 +635,16 @@ class Queue:
         self._control()
         used = self.db.execute("SELECT count(*) FROM tickets WHERE pool=? AND state='granted'", (row['pool'],)).fetchone()[0]
         over = used > self.limits[row['pool']]
-        if not over and (row['since'] is None or now - row['since'] < self.quantum):
+        urgent = preempt and self.db.execute("SELECT 1 FROM tickets WHERE pool=? AND state='queued' AND step<=? AND key!=?",
+                                             (row['pool'], now - URGENT, key)).fetchone() is not None
+        if not over and not urgent and (row['since'] is None or now - row['since'] < self.quantum):
             return False
         if not over and not self.db.execute("SELECT 1 FROM tickets WHERE pool=? AND state='queued' AND key!=?",
                                (row['pool'], key)).fetchone():
             return False
         last = self.db.execute('SELECT max(coalesce(pos, seq)) FROM tickets').fetchone()[0]
-        self.db.execute("UPDATE tickets SET state='queued', rank=1, pos=?, since=NULL, waited=? WHERE key=?",
+        # A rotated agent is in a tool: its step, if any, has not begun waiting yet.
+        self.db.execute("UPDATE tickets SET state='queued', rank=1, pos=?, since=NULL, waited=?, step=NULL WHERE key=?",
                         (last + 1, now, key))
         return True
 
@@ -655,7 +683,7 @@ class Queue:
                     'tickets': [
                 {**dict(r), 'idle': round(now - r['seen'])} for r in self.db.execute(
                     f"""SELECT seq,pool,session,turn,pid,state,coalesce(touched,created) AS seen
-                    FROM tickets WHERE {LIVE} ORDER BY rank, coalesce(pos, seq)""")]}
+                    FROM tickets WHERE {LIVE} {self._order(now)[0]}""", self._order(now)[1])]}
         if op == 'evict':
             seqs = data.get('seqs')
             if not isinstance(seqs, list) or not 0 < len(seqs) <= 64 or any(type(n) is not int for n in seqs):
@@ -765,8 +793,10 @@ class Queue:
                 raise ValueError('Invalid keys')
             now = time.time()
             with self.db:
+                # A tool boundary follows a model call: the holder has made progress, so an
+                # urgent subagent waiting may preempt it.
                 rotated = [k for k in keys if self.db.execute('SELECT 1 FROM tickets WHERE key=? AND pid=? AND birth=?',
-                           (k, data['pid'], data['birth'])).fetchone() and self._rotate(k, now)]
+                           (k, data['pid'], data['birth'])).fetchone() and self._rotate(k, now, preempt=True)]
                 self._promote()
             return {'rotated': rotated}
         if op == 'touch':
@@ -811,18 +841,17 @@ class Queue:
                     raise ValueError('Owner is not alive')
                 self.db.execute(insert, (*values, 'queued', now, now, data.get('instance', ''), rank))
                 self.db.execute(f'UPDATE tickets SET touched=? WHERE key=? AND {LIVE}', (now, data['key']))
+                step = data.get('step')
+                if step is not None:
+                    # When a subagent's model step began waiting: urgent URGENT seconds on.
+                    if type(step) not in (int, float) or not 0 <= step < 1e10:
+                        raise ValueError('Invalid step')
+                    self.db.execute("UPDATE tickets SET step=? WHERE key=? AND state='queued'", (min(step, now), data['key']))
                 if data.get('fresh') is True:
                     # A subagent taking its parent's slot starts a quantum of its own.
                     self.db.execute("UPDATE tickets SET since=? WHERE key=? AND state='granted'", (now, data['key']))
                 if data.get('rotate') is True:
                     self._rotate(data['key'], now)
-                if data.get('force') is True and not self.auto:
-                    self._control()
-                    if self.limits['agent'] > 0 and self.db.execute(
-                            "UPDATE tickets SET state='granted', since=? WHERE key=? AND state='queued'", (now, data['key'])).rowcount:
-                        # Claude Code abandons a subagent's step after 600 s without progress:
-                        # admit it over the limit rather than fail it. Nothing new starts until it drains.
-                        self.note({'at': now, 'overdraft': data['key'], 'limit': self.limits['agent']})
             else:
                 # Tombstone prevents a delayed acquire from resurrecting canceled work.
                 self.db.execute(insert, (*values, 'released', now, now, data.get('instance', ''), rank))
@@ -830,11 +859,9 @@ class Queue:
             self._promote()
         if op != 'acquire':
             return {'state': 'released'}
-        row = self.db.execute('SELECT seq,state,rank,coalesce(pos, seq) AS place FROM tickets WHERE key=?',
-                              (data['key'],)).fetchone()
-        position = self.db.execute("""SELECT count(*) FROM tickets WHERE pool=? AND state='queued'
-            AND (rank<? OR (rank=? AND coalesce(pos, seq)<=?))""",
-            (data['pool'], row['rank'], row['rank'], row['place'])).fetchone()[0]
+        row = self.db.execute('SELECT seq,state FROM tickets WHERE key=?', (data['key'],)).fetchone()
+        queue = self._queue(data['pool'], now)
+        position = queue.index(data['key']) + 1 if data['key'] in queue else 0
         result = {'state': row['state'], 'ticket': row['seq'], 'position': position}
         if self.limits['agent'] == 0:
             result['paused_until'] = self.until

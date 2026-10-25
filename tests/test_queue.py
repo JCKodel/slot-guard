@@ -13,8 +13,8 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, Queue, auto_limit, configure, duty, initialize, line_cap, capacity,
-                   line_until, local_call, process_identity, rate_load, recent_rate)
+from guard import (ACTIVITY_BUCKET, AUTO_STEP, RESTART_CONFIRM, URGENT, Queue, auto_limit, configure, duty, initialize, line_cap,
+                   capacity, line_until, local_call, process_identity, rate_load, recent_rate)
 
 
 class QueueTests(unittest.TestCase):
@@ -767,11 +767,11 @@ class AutoQueueTests(unittest.TestCase):
         self.assertEqual(self.q.operate(self.ticket('child', rank=0))['state'], 'granted')
         self.assertEqual(self.q.operate(self.ticket('new'))['state'], 'queued')
 
-    def test_forced_admission_cannot_bypass_automatic_limit(self):
+    def test_no_request_admits_a_waiting_ticket_over_the_limit(self):
         for k in 'abc': self.q.operate(self.ticket(k))
         self.assertEqual(self.q.operate(self.ticket('late', rank=0, force=True))['state'], 'queued')
         self.q.auto = False
-        self.assertEqual(self.q.operate(self.ticket('late', rank=0, force=True))['state'], 'granted')
+        self.assertEqual(self.q.operate(self.ticket('late', rank=0, force=True))['state'], 'queued')
 
     def test_limit_recovers_when_recent_usage_slows(self):
         for k in 'abc': self.acquire(k)
@@ -829,6 +829,43 @@ class AutoQueueTests(unittest.TestCase):
         self.q.db.execute("UPDATE tickets SET created=created-301 WHERE key='prompt'"); self.q.db.commit()
         self.q.operate(self.ticket('sub2', rank=0))
         self.assertEqual(self.q.operate(self.ticket('prompt'))['position'], 1)
+
+    def test_an_urgent_subagent_step_goes_first_and_preempts_at_a_tool_boundary(self):
+        q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b'}.get)
+        self.q.db.close(); self.q = q
+        now = time.time()
+        self.q.operate(self.ticket('holder'))
+        self.q.operate(self.ticket('main', rank=0))
+        # A subagent step waiting less than URGENT keeps its place: a tool boundary within
+        # the quantum is not a boundary to yield at.
+        sub = self.q.operate(self.ticket('sub', rank=0, step=now - 60))
+        self.assertEqual((sub['state'], sub['position']), ('queued', 2))
+        self.assertEqual(self.q.operate({'op':'rotate','keys':['holder'],'pid':10,'birth':'b'})['rotated'], [])
+        # Two minutes on it is urgent: first in line, and the holder yields at its next tool.
+        sub = self.q.operate(self.ticket('sub', rank=0, step=now - URGENT - 1))
+        self.assertEqual(sub['position'], 1)
+        self.assertEqual(self.q.operate(self.ticket('main', rank=0))['position'], 2)
+        self.assertEqual(self.q.operate({'op':'rotate','keys':['holder'],'pid':10,'birth':'b'})['rotated'], ['holder'])
+        self.assertEqual((self.state_of('sub'), self.state_of('main'), self.state_of('holder')), ('granted', 'queued', 'queued'))
+        self.assertEqual(self.q.db.execute("SELECT step FROM tickets WHERE key='sub'").fetchone()[0], None)
+        # Its own grant lasts a quantum like any other, even with another urgent subagent behind.
+        self.q.operate(self.ticket('sub2', rank=0, step=now - URGENT - 1))
+        self.assertEqual(self.q.operate(self.ticket('sub', rotate=True))['state'], 'granted')
+        self.assertEqual(self.q.operate({'op':'rotate','keys':['sub'],'pid':10,'birth':'b'})['rotated'], ['sub'])
+        self.assertEqual(self.state_of('sub2'), 'granted')
+
+    def test_a_step_start_honours_the_quantum_even_with_an_urgent_waiter(self):
+        q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b'}.get)
+        self.q.db.close(); self.q = q
+        self.q.operate(self.ticket('holder'))
+        self.q.operate(self.ticket('sub', rank=0, step=time.time() - URGENT - 1))
+        # Granted in a tool, the holder has not made a call yet: its step runs first.
+        self.assertEqual(self.q.operate(self.ticket('holder', rotate=True))['state'], 'granted')
+        self.age_grant('holder', 61)
+        self.assertEqual(self.q.operate(self.ticket('holder', rotate=True))['state'], 'queued')
+        self.assertEqual(self.state_of('sub'), 'granted')
+        # A rotated ticket carries no step until its next step acquire reports one.
+        self.assertEqual(self.q.db.execute("SELECT step FROM tickets WHERE key='holder'").fetchone()[0], None)
 
     def test_rotate_ignores_other_owners_and_fresh_restarts_the_quantum(self):
         q = Queue(Path(self.temp.name)/'r.db', 1, {10:'b', 11:'c'}.get)
