@@ -248,6 +248,27 @@ test('usage windows are reported on measure and by the heartbeat, once per chang
   await h.handlers['session.measure'](h.$,{changed:['context'],rateLimits:[]},async()=>({}));
   assert.equal(h.calls.filter(c=>c.op==='usage').length,2);
 });
+test('spend is reported as the session cost grows, from a baseline, through a /clear',async()=>{
+  const h=harness(async d=>d.op==='spend'?{spent:d.usd}:{state:'granted'});
+  const spent=()=>h.calls.filter(c=>c.op==='spend').map(c=>Math.round(c.usd*100)/100);
+  h.$.usage.cost={usd:12.5};await start(h);  // A resumed session's earlier cost is not new.
+  assert.deepEqual(spent(),[]);
+  h.$.usage.cost={usd:13.75};await beat(h);
+  h.$.usage.cost={usd:13.755};await beat(h);  // Under a cent waits for more.
+  assert.deepEqual(spent(),[1.25]);
+  h.$.usage.cost={usd:0.5};await beat(h);    // /clear: a new baseline, nothing reported.
+  h.$.usage.cost={usd:0.75};await beat(h);
+  delete h.$.usage.cost;await beat(h);        // A host without a cost ledger.
+  assert.deepEqual(spent(),[1.25,0.25]);
+});
+test('a failed spend report is retried with the next heartbeat',async()=>{
+  let fail=true;
+  const h=harness(async d=>{if(d.op==='spend'&&fail) throw new Error('busy'); return d.op==='spend'?{spent:d.usd}:{state:'granted'};});
+  h.$.usage.cost={usd:1};await start(h);
+  h.$.usage.cost={usd:2};await beat(h);
+  fail=false;h.$.usage.cost={usd:2.5};await beat(h);
+  assert.deepEqual(h.calls.filter(c=>c.op==='spend').map(c=>c.usd),[1,1.5]);
+});
 test('slots shows the automatic limit and window capacity',async()=>{
   const h=harness(async()=>({limits:{agent:2},auto:{enabled:true,cap:3,target:95,
     windows:[{kind:'five_hour',percent:82,elapsed:78,ceiling:76.44,margin:-5.56,agents:2.4,rate:3.1,source:'measured'}]},tickets:[]}));

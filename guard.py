@@ -37,7 +37,9 @@ AUTO_STEP = 600     # Recovery only; unsafe concurrency is reduced on every oper
 AUTO_IDLE = 3600
 AUTO_HEADROOM = 1.1  # A new slot needs 10% spare capacity, so the limit does not flap.
 LINE_GUARD = 3600   # Seconds ahead the continuous ceiling must hold at the current capacity.
+BURST = 3 * 3600    # A margin under the ceiling (a night's unused budget) is spent over this long.
 LINE_RESERVE = 1.0  # Whole-point readings: the tolerance over the ceiling and the reserve under 98%.
+LINE_FLOOR = 1.0    # The ceiling's least, so with its tolerance a renewed window starts at 2%.
 # Per-agent startup estimates, also used when a flat reading cannot measure consumption.
 DEFAULT_RATE = {'five_hour': 20 / 3600, 'seven_day': 1 / 3600}
 # A reading of the same window this many points under the stored one means the account's
@@ -61,6 +63,21 @@ DUTY_SPAN = 7 * 86400  # Hours a day are learned from the last week,
 DUTY_PRIOR = (8 * 3600, 86400)  # starting from 8 hours a day, weighted as one day.
 DUTY_FLOOR = 1 / 24
 
+# Spend: the dollars Claude Code prices each session's API responses at, reported by the
+# mod as they grow. Points per dollar hold far steadier than points per agent-hour (idle
+# agents, long tools and context size all move the latter), so a window's consumption is
+# learned as points per dollar over the last LEARN_SPAN, across windows, nights and resets.
+SPEND_BUCKET = 60
+LEARN_SPAN = 7 * 86400
+PRIOR_POINTS = 2.0  # Weight, in points, of the prior a learned conversion starts from.
+# Five-hour points per weekly point: the prior of a window learned only through the other.
+POINTS_RATIO = {'five_hour': 4.0, 'seven_day': 0.25}
+# Dollars per agent-second: over the last hour of work, weighted like this many agent-seconds
+# of the week's mean, and that of the startup guess.
+AGENT_SPAN = 3600
+AGENT_PRIOR = 900
+DEFAULT_AGENT_USD = 30 / 3600
+
 
 def active_time(buckets, start, end):
     """Seconds of activity from start to end; buckets: sorted start times of active buckets."""
@@ -80,6 +97,39 @@ def duty(buckets, first, now):
     active = active_time(buckets, now - observed, now + ACTIVITY_BUCKET)
     share = (active + DUTY_PRIOR[0]) / (observed + DUTY_PRIOR[1])
     return min(1.0, max(DUTY_FLOOR, share))
+
+
+class Spend:
+    """Dollars spent over time ranges, from (bucket, usd) rows oldest first."""
+
+    def __init__(self, rows):
+        self.at = [b for b, _ in rows]
+        self.cum = [0.0]
+        for _, usd in rows:
+            self.cum.append(self.cum[-1] + usd)
+
+    def __bool__(self):
+        return bool(self.at)
+
+    def between(self, start, end):
+        """Dollars of the buckets starting from `start` up to, not including, `end`."""
+        return self.cum[bisect_left(self.at, end)] - self.cum[bisect_left(self.at, start)]
+
+
+def agent_spend(buckets, loads, spend, now):
+    """Dollars per agent-second of work: the mean of the complete buckets in `buckets` since
+    spend was first recorded, blended with DEFAULT_AGENT_USD, or the last AGENT_SPAN of
+    activity blended with that mean if more. Agents doing cheap work for an hour do not
+    make the next agent cheaper than a typical one."""
+    def over(bs):
+        work = sum(loads.get(b, 1.0) for b in bs) * ACTIVITY_BUCKET
+        return sum(spend.between(b, b + ACTIVITY_BUCKET) for b in bs), work
+    # Work before the first report spent unrecorded dollars; the current bucket is still filling.
+    done = [b for b in buckets if spend.at[0] <= b and b + ACTIVITY_BUCKET <= now]
+    usd, work = over(done)
+    mean = (usd + AGENT_PRIOR * DEFAULT_AGENT_USD) / (work + AGENT_PRIOR)
+    usd, work = over(done[-(AGENT_SPAN // ACTIVITY_BUCKET):])
+    return max(mean, (usd + AGENT_PRIOR * mean) / (work + AGENT_PRIOR))
 
 
 def recent_rate(history, now, kind, buckets=None):
@@ -116,25 +166,30 @@ def rate_load(history, now, kind, buckets, loads):
 
 
 def line_cap(resets, length, now):
-    """The explicit continuous ceiling, in percentage points (never rounded for control)."""
-    return AUTO_TARGET * min(1.0, max(0.0, (now - (resets - length)) / length))
+    """The explicit continuous ceiling, in percentage points (never rounded for control),
+    never under LINE_FLOOR: a renewed window's first hours are not held to almost nothing."""
+    return max(LINE_FLOOR, AUTO_TARGET * min(1.0, max(0.0, (now - (resets - length)) / length)))
 
 
 def capacity(percent, resets, length, now, per_agent, share=1.0):
     """Agents a window sustains, burning `per_agent` percent per agent-second of work.
 
-    The lesser of two: what is left of 98% (less a point for whole-point readings)
-    spread over the working time left, `share` of the clock; and what stays within
-    a point of the continuous ceiling for the next LINE_GUARD seconds. None outside
-    the window.
+    The greater of two paces: what is left of 98% (less a point for whole-point readings)
+    spread over the working time left, `share` of the clock; and the margin under the
+    continuous ceiling spent over the next BURST seconds on top of what the ceiling
+    releases, so a night's unused budget goes in a morning burst that tapers off. Never
+    more than stays within a point of the ceiling for the next LINE_GUARD seconds. None
+    outside the window.
     """
     if not resets - length <= now < resets:
         return None
     left = resets - now
     spread = max(0.0, AUTO_TARGET - LINE_RESERVE - percent) / (share * left)
-    guard = min(LINE_GUARD, left)
-    within = max(0.0, line_cap(resets, length, now) + LINE_RESERVE - percent) / guard + AUTO_TARGET / length
-    return min(spread, within) / per_agent
+    margin = max(0.0, line_cap(resets, length, now) + LINE_RESERVE - percent)
+    # Near the end the ceiling's point of tolerance would aim past the target.
+    burst = min(margin, max(0.0, AUTO_TARGET - LINE_RESERVE - percent)) / min(BURST, left) + AUTO_TARGET / length
+    within = margin / min(LINE_GUARD, left) + AUTO_TARGET / length
+    return min(max(spread, burst), within) / per_agent
 
 
 def line_until(percent, resets, length, now):
@@ -312,6 +367,8 @@ class Queue:
         # so older coordinators sharing the database keep inserting there unchanged.
         self.db.execute('''CREATE TABLE IF NOT EXISTS load (bucket INTEGER PRIMARY KEY,
             agents REAL NOT NULL, samples INTEGER NOT NULL)''')
+        # Dollars of API responses per SPEND_BUCKET, machine-wide; kept through resets and forget.
+        self.db.execute('CREATE TABLE IF NOT EXISTS spend (bucket INTEGER PRIMARY KEY, usd REAL NOT NULL)')
         # Sessions ('*': every session) whose agents start at once, over the limit, until `until`.
         self.db.execute('CREATE TABLE IF NOT EXISTS sprints (session TEXT PRIMARY KEY, until REAL NOT NULL)')
         if 'rank' not in columns:
@@ -355,6 +412,11 @@ class Queue:
         share = duty(buckets, first, now)
         loads = dict(self.db.execute('SELECT bucket,agents/samples FROM load WHERE bucket>=?',
                                      (now - DUTY_SPAN - ACTIVITY_BUCKET,)))
+        spend = Spend(self.db.execute('SELECT bucket,usd FROM spend WHERE bucket>=? ORDER BY bucket',
+                                      (now - LEARN_SPAN - ACTIVITY_BUCKET,)).fetchall())
+        if spend:
+            agent_usd = agent_spend(buckets, loads, spend, now)
+            learned = {kind: self._learned(kind, spend, now) for kind in WINDOWS}
         result = []
         for r in self.db.execute('SELECT * FROM usage').fetchall():
             if r['kind'] not in WINDOWS:
@@ -373,12 +435,23 @@ class Queue:
                 per_agent, source = self._inherited(r['kind'], r['resets'], buckets, loads), 'inherited'
                 if per_agent is None:
                     per_agent, source = DEFAULT_RATE[r['kind']], 'default'
+            estimate, extra = r['percent'], {}
+            if spend:
+                # Points per dollar, learned; dollars per agent-second, measured. Between
+                # whole-point readings the dollars spent since the last one move the estimate,
+                # never a point past it. The estimate paces; only readings pause (line_until).
+                k = self._conversion(r['kind'], learned, per_agent / agent_usd)
+                per_agent, source = k * agent_usd, 'spend'
+                if history:
+                    estimate += min(1.0, k * spend.between(history[-1][1], now + SPEND_BUCKET))
+                extra = {'estimate': round(estimate, 2), 'usd_per_point': round(1 / k, 2),
+                         'usd_per_agent_hour': round(agent_usd * 3600, 2)}
             length = WINDOWS[r['kind']]
-            window = {'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'],
+            window = {'kind': r['kind'], 'percent': r['percent'], 'resets': r['resets'], **extra,
                       'elapsed': round(100 * (1 - (r['resets'] - now) / length), 1),
                       # Percent per agent-hour of work, and where it comes from.
                       'rate': round(per_agent * 3600, 2), 'source': source,
-                      'agents': capacity(r['percent'], r['resets'], length, now, per_agent,
+                      'agents': capacity(estimate, r['resets'], length, now, per_agent,
                                          share if active else 1.0),
                       'ceiling': line_cap(r['resets'], length, now),
                       'line_until': line_until(r['percent'], r['resets'], length, now)}
@@ -388,13 +461,42 @@ class Queue:
             result.append(window)
         return result
 
+    def _learned(self, kind, spend, now):
+        """(points, dollars): how much the windows of `kind` grew over the last LEARN_SPAN,
+        and the dollars spent meanwhile, counting only since spend was first recorded."""
+        windows = []
+        for resets, percent, at in self.db.execute(
+                'SELECT resets,percent,at FROM usage_log WHERE kind=? AND at>=? ORDER BY at',
+                (kind, max(now - LEARN_SPAN, spend.at[0]))):
+            window = next((w for w in windows if abs(w[0] - resets) <= 60), None)
+            if window is None:
+                windows.append([resets, (percent, at), (percent, at)])
+            else:
+                window[2] = (percent, at)
+        points = usd = 0.0
+        for _, (p0, t0), (p1, t1) in windows:
+            if p1 > p0:
+                points += p1 - p0
+                usd += spend.between(t0, t1)
+        return points, usd
+
+    def _conversion(self, kind, learned, fallback):
+        """Points of `kind` per dollar: what its windows grew by over what was spent, starting
+        from PRIOR_POINTS at the other window's conversion (POINTS_RATIO), or, before that
+        is known, at `fallback`: the rate per agent the readings alone give, per dollar."""
+        other = 'seven_day' if kind == 'five_hour' else 'five_hour'
+        points, usd = learned[other]
+        prior = points / usd * POINTS_RATIO[kind] if points >= PRIOR_POINTS and usd > 0 else fallback
+        points, usd = learned[kind]
+        return (points + PRIOR_POINTS) / (usd + PRIOR_POINTS / prior)
+
     def _inherited(self, kind, resets, buckets, loads):
-        """Percent per agent-second the previous window of `kind` ended with, if it ended
-        within one window before this one started; None otherwise. History lasts 2 days."""
+        """Percent per agent-second the last earlier window of `kind` ended with, however long
+        the gap (a night off); None without one. History lasts LEARN_SPAN."""
         length = WINDOWS[kind]
         previous = self.db.execute('SELECT max(resets) FROM usage_log WHERE kind=? AND resets<=?',
                                    (kind, resets - length + 60)).fetchone()[0]
-        if previous is None or previous < resets - 2 * length:
+        if previous is None:
             return None
         history = [tuple(h) for h in self.db.execute(
             'SELECT percent,at FROM usage_log WHERE kind=? AND abs(resets-?)<=60 ORDER BY at', (kind, previous))]
@@ -449,7 +551,8 @@ class Queue:
                         limit, changed = step, now
             if limit != previous:
                 self.note({'at': now, 'from': previous, 'to': limit, 'cap': self.cap, 'max': self.ceiling,
-                           'windows': {w['kind']: {k: w[k] for k in ('percent', 'agents', 'rate', 'source', 'margin')}
+                           'windows': {w['kind']: {k: w[k] for k in ('percent', 'estimate', 'agents', 'rate', 'source',
+                                                                      'margin', 'usd_per_point', 'usd_per_agent_hour') if k in w}
                                        for w in windows}})
             self.db.execute("INSERT OR REPLACE INTO control VALUES ('limit',?),('changed',?)", (limit, changed))
             # Emergency ceiling breach: retain the reduced limit for recovery.
@@ -637,11 +740,22 @@ class Queue:
                                         (r['kind'], r['resets'], percent, self.clock()))
                         self.note({'at': self.clock(), 'kind': r['kind'], 'resets': r['resets'],
                                    'percent': percent}, self.readings)
-                self.db.execute('DELETE FROM usage_log WHERE at<?', (self.clock() - 2 * 86400,))
+                self.db.execute('DELETE FROM usage_log WHERE at<?', (self.clock() - LEARN_SPAN - 86400,))
+                self.db.execute('DELETE FROM spend WHERE bucket<?', (self.clock() - LEARN_SPAN - 86400,))
                 self.db.execute('DELETE FROM activity WHERE bucket<?', (self.clock() - DUTY_SPAN - 86400,))
                 self.db.execute('DELETE FROM load WHERE bucket<?', (self.clock() - DUTY_SPAN - 86400,))
                 self._promote()
             return {'limit': self.limits['agent']}
+        if op == 'spend':
+            # Dollars a session's API responses cost since its last report: counts, never content.
+            usd = data.get('usd')
+            if type(usd) not in (int, float) or not 0 < usd < 1000:  # NaN fails both comparisons.
+                raise ValueError('Invalid spend')
+            bucket = int(self.clock() // SPEND_BUCKET) * SPEND_BUCKET
+            with self.db:
+                self.db.execute('''INSERT INTO spend VALUES (?,?) ON CONFLICT(bucket)
+                    DO UPDATE SET usd=usd+excluded.usd''', (bucket, usd))
+            return {'spent': usd}
         if op == 'rotate':
             # Agents between model calls (running tools) offer their slot to those waiting.
             self.validate_owner(data)
@@ -887,7 +1001,7 @@ def main():
         if data.get('op') == 'configure':
             print(json.dumps(configure(args.home, data)))
             return
-        if data.get('op') not in ('status', 'evict', 'reset', 'sprint'):
+        if data.get('op') not in ('status', 'evict', 'reset', 'sprint', 'spend'):
             data.update(claude_owner())
         print(json.dumps(local_call(args.home, data)))
 

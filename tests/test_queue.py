@@ -274,9 +274,9 @@ class AutoLimitTests(unittest.TestCase):
 
     def test_continuous_ceiling_releases_budget_every_minute_and_ends_at_98(self):
         for length in (5*self.H, 7*24*self.H):
-            self.assertEqual(line_cap(length, length, 0), 0)
+            self.assertEqual(line_cap(length, length, 0), 1)  # A renewed window's floor.
             self.assertAlmostEqual(line_cap(length, length, length*0.86), 84.28)
-            self.assertAlmostEqual(line_cap(length, length, 60), 98*60/length)
+            self.assertAlmostEqual(line_cap(length, length, length*0.02), 98*0.02)
             self.assertEqual(line_cap(length, length, length), 98)
             self.assertEqual(line_cap(length, length, length+60), 98)
         self.assertEqual(line_cap(7*24*self.H, 7*24*self.H, 24*self.H), 14)
@@ -293,20 +293,32 @@ class AutoLimitTests(unittest.TestCase):
 
     def test_capacity_spreads_what_is_left_over_the_working_time_left(self):
         H, W = self.H, 7*86400
-        # 9% used, 125 hours left, 1%/h per agent: three agents at 8 hours a day, one around the clock.
+        # On the ceiling (25.08% at 125 hours left), 1%/h per agent: 72 points over 12
+        # hours a day of the 125 left, where the margin left to burst is only the point.
         now = W - 125*H
-        self.assertAlmostEqual(capacity(9, W, W, now, 1/H, 1/3), 88/(125/3), places=6)
-        self.assertAlmostEqual(capacity(9, W, W, now, 1/H), 88/125, places=6)
+        self.assertAlmostEqual(capacity(25, W, W, now, 1/H, 1/2), 72/(125/2), places=6)
         # Twice the burn per agent, half the agents.
-        self.assertAlmostEqual(capacity(9, W, W, now, 2/H, 1/3), 44/(125/3), places=6)
+        self.assertAlmostEqual(capacity(25, W, W, now, 2/H, 1/2), 36/(125/2), places=6)
+
+    def test_capacity_bursts_a_margin_under_the_ceiling_over_three_hours(self):
+        H, W = self.H, 7*86400
+        # 9% used where the ceiling is at 25.08%: 17 points to spend over 3 hours, on top
+        # of the ceiling's 0.58 an hour, rather than 88 points over the learned 8 hours a day.
+        now = W - 125*H
+        margin = line_cap(W, W, now) + 1 - 9
+        self.assertAlmostEqual(capacity(9, W, W, now, 1/H, 1/3), margin/3 + 98*H/W, places=6)
+        # Near the end the burst aims at 97%, not at the ceiling's tolerance past 98%.
+        self.assertAlmostEqual(capacity(95, W, W, W - 2*H, 1/H), 2/2 + 98*H/W, places=6)
         self.assertIsNone(capacity(9, W, W, W, 1/H))
         self.assertIsNone(capacity(9, W, W, -1, 1/H))
 
     def test_capacity_never_outruns_the_continuous_ceiling(self):
         H, W = self.H, 7*86400
-        # A renewed week at 8 hours a day would spread 2.9%/h, but the ceiling holds 1 point
-        # of tolerance plus what it releases in the next hour: 1.58 points.
-        self.assertAlmostEqual(capacity(0, W, W, 60, 1/H, 1/3), (1 + 98*60/W + 98*H/W), places=6)
+        # A renewed week at 4 hours a day would spread 3.5%/h, but the ceiling holds its floor
+        # and point of tolerance plus what it releases in the next hour: 2.58 points.
+        self.assertAlmostEqual(capacity(0, W, W, 60, 1/H, 1/6), (2 + 98*H/W), places=6)
+        # At 8 hours a day the spread, 1.73%/h, is under that.
+        self.assertAlmostEqual(capacity(0, W, W, 60, 1/H, 1/3), 97/((W - 60)/3/H), places=6)
         # On the line with no tolerance left the ceiling allows only what it releases.
         self.assertAlmostEqual(capacity(51, W, W, W/2, 1/H, 1/3), 98*H/W, places=6)
         # The 5-hour window releases 19.6 points an hour: its ceiling seldom binds.
@@ -335,8 +347,8 @@ class AutoLimitTests(unittest.TestCase):
         for length in (5*self.H, 7*24*self.H):
             self.assertIsNone(line_until(50, length, length, length/2))  # One whole point of tolerance.
             self.assertAlmostEqual(line_until(51, length, length, length/2), length*50/98)
-            self.assertIsNone(line_until(1, length, length, 60))  # A renewed window's first point.
-            self.assertAlmostEqual(line_until(2, length, length, 60), length/98)
+            self.assertIsNone(line_until(2, length, length, 60))  # A renewed window's floor and point.
+            self.assertAlmostEqual(line_until(3, length, length, 60), 2*length/98)
             self.assertEqual(line_until(98, length, length, length-1), length)
             self.assertIsNone(line_until(98, length, length, length))
 
@@ -357,7 +369,7 @@ class AutoLimitTests(unittest.TestCase):
                 worked += limit
         self.assertGreater(used, 96)
         self.assertLessEqual(used, 98)
-        self.assertLess(cuts, 10)
+        self.assertLess(cuts, 7*6)  # Each morning's burst tapers off a slot at a time.
 
 
 class AutoQueueTests(unittest.TestCase):
@@ -497,8 +509,8 @@ class AutoQueueTests(unittest.TestCase):
         weekly(1)  # The upgraded account's window, or a stale response: wait for another.
         self.assertEqual(self.q.windows()[0]['percent'], 41)
         self.now += RESTART_CONFIRM
-        # The pause is over; the restarted week sustains two at the startup guess.
-        self.assertEqual(weekly(2)['limit'], 2)
+        # The pause is over; the restarted week's margin bursts the normal limit at the startup guess.
+        self.assertEqual(weekly(2)['limit'], 3)
         self.assertEqual(self.q.windows()[0]['percent'], 2)
         self.assertIn('restart', (Path(self.temp.name)/'auto.log').read_text())
         self.assertEqual(self.q.db.execute('SELECT count(*) FROM usage_log').fetchone()[0], 1)
@@ -520,6 +532,23 @@ class AutoQueueTests(unittest.TestCase):
         self.assertAlmostEqual(weekly['rate'], 0.5, places=1)
         share = weekly['hours'] / 24
         self.assertGreater(weekly['agents'], capacity(0, old + 7*86400, 7*86400, self.now, 1/H, share))
+
+    def test_a_window_after_a_night_off_inherits_the_rate_per_agent_it_ended_with(self):
+        H, B = self.H, ACTIVITY_BUCKET
+        old = self.now + H
+        # One agent working the last hour of a window: 3 points, 3 per agent-hour.
+        for t in range(0, H, B):
+            self.q.db.execute('INSERT INTO activity VALUES (?)', (self.now + t,))
+            self.q.db.execute('INSERT INTO load VALUES (?,1,1)', (self.now + t,))
+        for i in range(4):
+            self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':10 + i,'resets':old}]})
+            self.now += H / 3 - (i == 2)
+        self.now = old + 14*H  # The next window starts after the night.
+        self.q.operate({'op':'usage','readings':[{'kind':'five_hour','percent':0,'resets':self.now + 5*H}]})
+        window = next(w for w in self.q.windows() if w['kind'] == 'five_hour')
+        self.assertEqual(window['source'], 'inherited')
+        self.assertAlmostEqual(window['rate'], 3, places=0)
+        self.assertGreater(window['agents'], 5)
 
     def test_the_weekly_rate_follows_the_last_two_working_hours(self):
         H = self.H
@@ -570,7 +599,7 @@ class AutoQueueTests(unittest.TestCase):
         self.assertAlmostEqual(w['rate'], 1.0, places=1)  # Per agent.
         self.assertAlmostEqual(w['hours'], 10, delta=1.5)
         self.assertAlmostEqual(w['agents'], capacity(41, resets, 7*24*H, self.now, 1/H, w['hours']/24), delta=0.1)
-        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], int(w['agents']))
+        self.assertEqual(self.q.operate({'op':'status'})['limits']['agent'], min(3, int(w['agents'])))
 
     def test_working_time_is_recorded_and_outlives_a_reset(self):
         self.usage(9, 125, kind='seven_day')
@@ -818,6 +847,154 @@ class AutoQueueTests(unittest.TestCase):
             self.assertEqual(q.operate({'op':'status'})['limits']['agent'], 3)
         finally:
             q.db.close()
+
+
+class SpendScenarioTests(unittest.TestCase):
+    """The cases the automatic limit was reported wrong in, with consumption learned from
+    spend as measured: a point of the five-hour window per $6, of the week per $24, and
+    $24 per agent-hour, so an agent spends 1% of the week an hour."""
+    H = 3600
+    K = {'five_hour': 1/6, 'seven_day': 1/24}
+    AGENT_USD = 24 / 3600
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.now = 10**7 - 10**7 % 86400  # Midnight.
+        self.q = Queue(Path(self.temp.name)/'q.db', 5, {10:'b'}.get, auto=True, clock=lambda: self.now)
+
+    def tearDown(self):
+        self.q.db.close(); self.temp.cleanup()
+
+    def work(self, agents, usd):
+        """`agents` working in the current bucket, spending `usd`."""
+        bucket = int(self.now // ACTIVITY_BUCKET) * ACTIVITY_BUCKET
+        self.q.db.execute('INSERT OR IGNORE INTO activity VALUES (?)', (bucket,))
+        self.q.db.execute('INSERT OR REPLACE INTO load VALUES (?,?,1)', (bucket, agents))
+        self.q.db.commit()
+        self.q.operate({'op':'spend','usd':usd})
+
+    def learn(self):
+        """Ten working hours a day for a week, the last two of them by two agents a day ago,
+        spending, and the points both windows grew by meanwhile."""
+        H, B = self.H, ACTIVITY_BUCKET
+        now = self.now
+        for day in range(2, 8):
+            for t in range(now - day*86400 + 9*H, now - day*86400 + 19*H, B):
+                self.q.db.execute('INSERT INTO activity VALUES (?)', (t,))
+        self.now -= 26*H
+        start = self.now
+        for _ in range(2*H // B):
+            self.work(2, 2*self.AGENT_USD*B)
+            self.now += B
+        for kind, resets in (('five_hour', start + 3*H), ('seven_day', start + 3*86400)):
+            spent = 2*self.AGENT_USD*2*H
+            self.q.db.execute('INSERT INTO usage_log VALUES (?,?,0,?),(?,?,?,?)',
+                              (kind, resets, start, kind, resets, spent*self.K[kind], self.now - 1))
+        self.q.db.commit()
+        self.now = now
+
+    def readings(self, five=None, week=None):
+        """Report (percent, ceiling) per window: the reset that puts the ceiling there."""
+        def resets(kind, ceiling):
+            length = 5*self.H if kind == 'five_hour' else 7*86400
+            return self.now + length * (1 - ceiling / 98)
+        readings = [{'kind':kind, 'percent':p, 'resets':resets(kind, c)}
+                    for kind, pc in (('five_hour', five), ('seven_day', week)) if pc for p, c in [pc]]
+        return self.q.operate({'op':'usage','readings':readings})['limit']
+
+    def test_the_conversion_is_learned_from_spend(self):
+        self.learn()
+        self.readings(five=(0, 0.1), week=(1, 10.8))
+        w = {w['kind']: w for w in self.q.windows()}
+        self.assertEqual(w['seven_day']['source'], 'spend')
+        self.assertAlmostEqual(w['seven_day']['usd_per_point'], 24, delta=2)
+        self.assertAlmostEqual(w['five_hour']['usd_per_point'], 6, delta=0.5)
+        self.assertAlmostEqual(w['seven_day']['rate'], 1.0, delta=0.1)
+
+    def test_after_a_night_a_fresh_window_and_a_banked_week_burst(self):
+        # 25/10: back in the morning at 1% of the week where the ceiling is at 10.8%, the
+        # five-hour window just started, its previous one 14 hours ago. It was 1 slot.
+        self.learn()
+        self.assertGreaterEqual(self.readings(five=(0, 0.1), week=(1, 10.8)), 3)
+
+    def test_plenty_left_is_not_one_agent(self):
+        # 21/10: 11% of the five-hour window at 57%, 42% of the week at 54%: it was 1 slot.
+        self.learn()
+        self.assertGreaterEqual(self.readings(five=(11, 56), week=(42, 54)), 3)
+
+    def test_a_small_margin_holds_few_agents(self):
+        # 21/10: 53% where the week's ceiling is 58%: the 6 points left (the ceiling's point
+        # included) last 3 hours at 2 agents. 23/10: 6 slots with 3 points left: now 1.
+        self.learn()
+        self.assertEqual(self.readings(five=(5, 50), week=(53, 58)), 2)
+        self.assertEqual(self.readings(week=(55, 57)), 1)
+
+    def test_spend_since_the_last_reading_moves_the_estimate_up_to_a_point(self):
+        self.learn()
+        self.assertEqual(self.readings(week=(53, 58)), 2)
+        before = next(w for w in self.q.windows() if w['kind'] == 'seven_day')['agents']
+        # Three agents for 20 minutes: $24 spent, a point of the week not yet read, a third
+        # of an agent over the margin's three hours, less what the ceiling rose meanwhile.
+        for _ in range(4):
+            self.now += ACTIVITY_BUCKET
+            self.work(3, 3*self.AGENT_USD*ACTIVITY_BUCKET)
+        week = next(w for w in self.q.windows() if w['kind'] == 'seven_day')
+        self.assertAlmostEqual(week['estimate'], 54, delta=0.1)
+        self.assertLess(week['agents'], before - 0.25)
+        for _ in range(12):  # Three times more: still a point at most until a reading says more.
+            self.now += ACTIVITY_BUCKET
+            self.work(3, 3*self.AGENT_USD*ACTIVITY_BUCKET)
+        self.assertEqual(next(w for w in self.q.windows() if w['kind'] == 'seven_day')['estimate'], 54)
+
+    def test_a_restarted_window_learns_from_the_other(self):
+        # A plan change clears a window's readings: its conversion starts from the other's.
+        self.learn()
+        self.q.db.execute("DELETE FROM usage_log WHERE kind='five_hour'")
+        self.q.db.commit()
+        self.readings(five=(0, 0.1), week=(1, 10.8))
+        five = next(w for w in self.q.windows() if w['kind'] == 'five_hour')
+        self.assertAlmostEqual(five['usd_per_point'], 6, delta=0.5)
+
+    def week(self, night):
+        """A fresh week, every window renewing when due, five agents wanted from 9:00 to 20:00
+        and `night` through the rest. Asserts the readings never pass the ceiling by more than
+        its point and the five-hour window never reaches 98%; returns the week's points spent
+        and how many times the limit changed."""
+        H, B, W = self.H, ACTIVITY_BUCKET, 7*86400
+        week, five, true, changes = self.now + W, None, {'five_hour': 0.0, 'seven_day': 0.0}, 0
+        limit = self.q.operate({'op':'status'})['limits']['agent']
+        for _ in range(W // B - 1):
+            if five is not None and self.now >= five:
+                five, true['five_hour'] = None, 0.0
+            new = self.q.operate({'op':'status'})['limits']['agent']
+            changes += new != limit
+            limit = new
+            working = min(5 if 9 <= (self.now / H) % 24 < 20 else night, limit)
+            if working:
+                five = five or self.now + 5*H
+                usd = working * self.AGENT_USD * B
+                self.work(working, usd)
+                for kind in true:
+                    true[kind] += usd * self.K[kind]
+            readings = [{'kind':'seven_day', 'percent':int(true['seven_day']), 'resets':week}]
+            if five:
+                readings.append({'kind':'five_hour', 'percent':int(true['five_hour']), 'resets':five})
+            self.q.operate({'op':'usage','readings':readings})
+            self.assertLessEqual(true['seven_day'], line_cap(week, W, self.now) + 2)
+            self.assertLess(true['five_hour'], 98)
+            self.now += B
+        return true['seven_day'], changes
+
+    def test_a_working_week_holds_the_ceiling_and_uses_the_budget(self):
+        spent, changes = self.week(night=0)
+        self.assertGreater(spent, 90)
+        self.assertLess(changes, 7 * 8)  # Each morning's burst tapers off a slot at a time.
+
+    def test_unattended_nights_hold_the_ceiling_by_pausing(self):
+        # One agent around the clock spends 24 points a day of a week that releases 14:
+        # past the margin, the ceiling holds by pausing the last agent for part of each hour.
+        spent, _ = self.week(night=2)
+        self.assertGreater(spent, 90)
 
 
 if __name__ == '__main__': unittest.main()

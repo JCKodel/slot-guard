@@ -163,6 +163,17 @@ async function report($,registry,limits) {
   await call($,{op:'usage',readings});
   registry.reported=signature;
 }
+// Dollars this session's responses cost since the last report, as Claude Code prices them:
+// the coordinator learns how many points of each window a dollar takes. Counts, never content.
+async function spend($,registry,cost) {
+  const usd=cost && cost.usd;
+  if(!Number.isFinite(usd)) return;
+  // The first figure is the baseline (a resumed session's earlier cost); /clear starts over.
+  if(registry.cost===undefined || usd<registry.cost) {registry.cost=usd; return;}
+  if(usd-registry.cost<0.01) return;
+  await call($,{op:'spend',usd:Math.min(usd-registry.cost,999)});
+  registry.cost=usd;
+}
 async function heartbeat($,{held,orphans,pausedUntil,parked}) {
   const now=Date.now(), keys=[], longTools=[];
   for(const [owner,slot] of parked) {
@@ -222,7 +233,7 @@ async function status($,s) {
     [(s.auto.line ? `Paused: continuous usage ceiling reached; agents resume when the ceiling catches up at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots auto off" resumes now.`
       : `Paused: a usage window reached ${s.auto.target}%; agents resume when it renews at ${new Date(s.auto.until*1000).toLocaleTimeString()}. "/slots forget" or "/slots auto off" resumes now.`)] : [];
   const auto=s.auto&&s.auto.enabled ? [...paused,`Auto limit: ${s.limits.agent} (normal ${s.auto.cap}, max ${s.auto.max||s.auto.cap}), pacing to ${s.auto.target}% per window`+
-    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used, ${w.elapsed}% elapsed, ceiling ${w.ceiling.toFixed(2)}%, margin ${w.margin.toFixed(2)} pp`+(w.agents==null?'':`, capacity ${w.agents.toFixed(2)} agents`)+`, ${w.rate}%/h per agent (${w.source})`+(w.hours==null?'':`, ~${w.hours} h/day working`)).join('')] : [];
+    (s.auto.windows||[]).map(w=>`; ${w.kind} ${w.percent}% used`+(w.estimate==null?'':` (~${w.estimate.toFixed(1)}% by spend since)`)+`, ${w.elapsed}% elapsed, ceiling ${w.ceiling.toFixed(2)}%, margin ${w.margin.toFixed(2)} pp`+(w.agents==null?'':`, capacity ${w.agents.toFixed(2)} agents`)+`, ${w.rate}%/h per agent (${w.source}`+(w.usd_per_point==null?'':`: $${w.usd_per_point} per point, $${w.usd_per_agent_hour}/h per agent`)+`)`+(w.hours==null?'':`, ~${w.hours} h/day working`)).join('')] : [];
   const sprints=Object.entries(s.sprints||{});
   for(const [session,until] of sprints)
     auto.push(`Sprint: ${session==='*'?'every session':'session '+session.slice(0,8)} starts its agents at once until ${new Date(until*1000).toLocaleTimeString()}. "/slots sprint off" ends it.`);
@@ -245,10 +256,12 @@ export function register(on) {
     if(!timer) {
       // Tickets a previous load of this mod held in this process can no longer be released by it.
       await call($,{op:'adopt',instance}).catch(()=>{});
+      await $.session.usage().then(u=>spend($,registry,u.cost)).catch(()=>{});
       const every=Number(await $.env.get('SLOT_HEARTBEAT_MS'))||HEARTBEAT_MS;  // Tests shorten it.
       timer=$.clock.every(every,()=>{
         heartbeat($,registry).catch(()=>{});
-        $.session.usage().then(u=>report($,registry,u.rateLimits)).catch(()=>{});
+        $.session.usage().then(u=>Promise.all([report($,registry,u.rateLimits).catch(()=>{}),
+          spend($,registry,u.cost)])).catch(()=>{});
         const now=Date.now();
         for(const [k,state] of states)
           if(!state.ticket && state.busy===0 && state.waiting===0 && now-state.active>FORGET_MS) states.delete(k);

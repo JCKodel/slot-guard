@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0-beta.1
+
+- Consumption is learned from spend. The mod reports how many dollars each session's API responses cost as Claude Code prices them (the figure `/cost` shows), and the coordinator learns how many points of each window a dollar takes, over the last seven days and across windows, nights and resets. On the maintainer's machine a point took $5–7 of the five-hour window and $23–25 of the week, steady hour after hour, where points per agent-hour varied fivefold with idle agents, long tools and context size: that variation is what made the limit too strict one day and too loose the next. A renewed window no longer starts from a 20-points-per-agent-hour guess: back after a night at 1% of the week, with the ceiling at 11%, it was 1 slot and is now 3.
+- Dollars per agent-hour come from the last hour of work, never under the week's mean: an hour of cheap reading does not make the next agent look cheap.
+- Between whole-point readings, the dollars spent since the last one move the usage estimate, up to one point: capacity falls as soon as work speeds up, before the next point is read. Pauses still follow readings only.
+- A margin under the ceiling (a night's unused budget) is spent over three hours, on top of what the ceiling releases, and tapers off to the steady pace; capacity still never exceeds what keeps usage within a point of the ceiling for the next hour.
+- A renewed window inherits the rate per agent its previous window ended with however long ago that was, not only within one window length, and readings are kept eight days instead of two.
+- The ceiling is never under 1%: a renewed week's first 2% neither pause nor hold its first hours to a fraction of an agent. Past that, the week's steady pace still governs a renewal.
+- `/slots` shows each window's estimate, dollars per point and dollars per agent-hour; `auto.log` records them with each limit change.
+
 ## 0.6.14-beta.1
 
 - One rule sets each window's capacity: what is left of 98% spread over the working time left, divided by the consumption per agent, and never more than stays within a point of the continuous ceiling for the next hour. The week's working time is learned from activity, so office hours spread the week over office hours and a machine working around the clock over the clock. The end-of-window pace, the weekly average blend and the four-hour margin spending are gone; a night's unused budget no longer bursts every morning and cuts back every afternoon.
